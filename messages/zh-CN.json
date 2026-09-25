@@ -1,0 +1,10 @@
+{
+  "channel_cn": "国内版（中国大陆）",
+  "channel_intl": "国际版",
+  "channel_cn_description": "使用国内版 WorkBuddy 账号。浏览器授权；模型列表从当前账号的 /v3/config 获取，不检测额度。",
+  "channel_intl_description": "使用国际版 WorkBuddy AI 账号。浏览器授权；模型列表从当前账号的 /v3/config 获取。",
+  "model_ids": "自定义模型 ID",
+  "model_ids_description": "可选，每行一个模型 ID。填写后仅同步这些明确指定的模型；留空时从账号的 /v3/config 实时发现。不会检测额度或自动调用模型。",
+  "invalid_model_ids": "模型 ID 必须是非空单行文本，每项最长 200 字符，不允许控制字符或重复项。",
+  "invalid_options": "存在不支持的 WorkBuddy 配置字段。"
+}

@@ -1,0 +1,10 @@
+{
+  "channel_cn": "China (mainland)",
+  "channel_intl": "International",
+  "channel_cn_description": "Use a mainland WorkBuddy account with browser authorization. Models are discovered from this account's /v3/config; no quota check is performed.",
+  "channel_intl_description": "Use an international WorkBuddy AI account with browser authorization. Models are discovered from this account's /v3/config.",
+  "model_ids": "Custom model IDs",
+  "model_ids_description": "Optional, one model ID per line. When set, only these explicitly configured models are synchronized. Otherwise models are discovered from the account's /v3/config. No quota check or model call is performed.",
+  "invalid_model_ids": "Model IDs must be nonempty single-line text, at most 200 characters each, with no control characters or duplicates.",
+  "invalid_options": "Unsupported WorkBuddy configuration fields were provided."
+}
