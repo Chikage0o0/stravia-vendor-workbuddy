@@ -17,10 +17,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 未指定 toolchain 时自动读取 rust-toolchain.toml（channel 1.98.1）
+      # rust-toolchain.toml 是工具链版本的唯一来源
+      - name: Read rust-toolchain.toml
+        id: toolchain
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: wasm32-wasip2
 
       - uses: Swatinem/rust-cache@v2
