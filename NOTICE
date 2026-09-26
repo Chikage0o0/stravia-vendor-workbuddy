@@ -2,6 +2,4 @@ WorkBuddy Vendor Plugin
 
 本插件不是腾讯 WorkBuddy 官方发布的插件。
 上游服务、产品名称及商标归各自权利人所有。
-
-第三方组件声明：
-  rust_decimal（依赖项）— MIT，完整版权声明见 vendor/rust_decimal.LICENSE。
+。

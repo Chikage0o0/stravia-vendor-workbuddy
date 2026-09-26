@@ -49,7 +49,7 @@ pub(crate) fn descriptor() -> VendorDescriptor {
         version: Version::parse(env!("CARGO_PKG_VERSION")).expect("valid Cargo version"),
         display_name: "WorkBuddy".into(),
         description: Some("WorkBuddy China and international browser-login provider".into()),
-        authors: vec!["WorkBuddyPlugin contributors".into()],
+        authors: vec!["Chikage0o0 <chikage@939.me>".into()],
         canonical_format_version: CANONICAL_FORMAT_VERSION,
         kind: VendorKind::Dedicated,
         providers: vec![ProviderDescriptor {
