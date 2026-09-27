@@ -227,6 +227,15 @@ fn parse_models(rows: &[Value], source: &str) -> Result<DiscoverResponse, Plugin
                 json!([{"type":"effort", "values":efforts}]),
             );
         }
+        // 目录的 reasoning.effort 是固定档、defaultEffort 是默认档；
+        // 推理缺省注入 effort 时优先取目录声明值。
+        if let Some(effort) = row
+            .pointer("/reasoning/defaultEffort")
+            .or_else(|| row.pointer("/reasoning/effort"))
+            .and_then(Value::as_str)
+        {
+            metadata.insert("reasoning_default_effort".into(), json!(effort));
+        }
         models.push(DiscoveredModel {
             id: id.into(),
             display_name: row.get("name").and_then(Value::as_str).unwrap_or(id).into(),

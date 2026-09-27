@@ -14,8 +14,8 @@ use stravia_runtime_contract::protocol::ids::ProtocolEndpoint;
 use stravia_runtime_contract::protocol::ir::AiRequest;
 use stravia_vendor_common::common;
 use stravia_vendor_sdk::{
-    AiErrorKind, AiStreamDelta, ErrorKind, GuestHost, HttpRequest, HttpResponse, OperationOutput,
-    PluginError, ProviderSnapshot, read_http_body,
+    AiErrorKind, AiStreamDelta, ErrorKind, GuestHost, HttpRequest, HttpResponse, ModelMetadata,
+    OperationOutput, PluginError, ProviderSnapshot, read_http_body,
 };
 
 use crate::{PROTOCOL, Region, auth};
@@ -51,7 +51,7 @@ pub(crate) fn execute(
     let auth_headers = auth::headers(provider, region)?;
     let encoded = common::encode_inference_request(PROTOCOL, &request)?;
     let mut body = encoded.body;
-    normalize_request_body(&mut body);
+    normalize_request_body(&mut body, provider.model_metadata.as_ref());
     let body = serde_json::to_vec(&body).map_err(|error| {
         common::plugin_error(
             ErrorKind::Invalid,
@@ -82,14 +82,16 @@ fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
 /// developer→system（11128）、首条 system 兜底、tool_choice 归一（11101）、
 /// max_completion_tokens 别名、deepseek 思考模式 reasoning 回填（11155）。
 /// 不做指纹清洗，不改写用户提示词。
-fn normalize_request_body(body: &mut Value) {
+fn normalize_request_body(body: &mut Value, model_metadata: Option<&ModelMetadata>) {
     normalize_tool_choice(body);
     translate_max_completion_tokens(body);
     let is_deepseek = body
         .get("model")
         .and_then(Value::as_str)
         .is_some_and(|model| model.to_ascii_lowercase().starts_with("deepseek"));
-    let thinking_enabled = deepseek_thinking_enabled(body);
+    // 思考字段先落成最终线上形态，历史回填门槛以序列化结果为准。
+    let thinking_enabled =
+        is_deepseek && serialize_deepseek_thinking(body, model_metadata);
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
@@ -201,30 +203,68 @@ fn translate_max_completion_tokens(body: &mut Value) {
     }
 }
 
-/// deepseek 系模型在 `thinking.type` 非 disabled 且 effort 非 none
-/// 时视为思考开启；thinking.enabled 恒为开。
-fn deepseek_thinking_enabled(body: &Value) -> bool {
-    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
-    if !model.to_ascii_lowercase().starts_with("deepseek") {
+/// 官方客户端 thinkingFormat=deepseek 的线规形态：
+///   开启 → `thinking:{type:"enabled"}`（客户端自带 type 不覆盖）+
+///          `reasoning_effort` 档位（缺省补目录默认档，再兜底 "high"）+
+///          `reasoning_summary:"auto"`；
+///   关闭 → `thinking:{type:"disabled"}` 并删除 `reasoning_effort`——
+///          上游档位表没有 "none"，关的语义是删字段。
+/// `thinking.type` 单独不足以驱动推理：上游实测只在 effort 到位时产出
+/// reasoning_content。返回最终思考状态，供历史回填门槛判断。
+fn serialize_deepseek_thinking(body: &mut Value, model_metadata: Option<&ModelMetadata>) -> bool {
+    let Some(object) = body.as_object_mut() else {
         return false;
+    };
+    // reasoningEffort 旧写法归并到 reasoning_effort。
+    if let Some(camel) = object.remove("reasoningEffort") {
+        object.entry("reasoning_effort".to_owned()).or_insert(camel);
     }
-    let thinking_type = body
+    let thinking_type = object
         .get("thinking")
         .and_then(|thinking| thinking.get("type"))
         .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let effort = object
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .map(str::trim)
         .unwrap_or("");
-    if thinking_type.eq_ignore_ascii_case("enabled") {
-        return true;
-    }
-    if thinking_type.eq_ignore_ascii_case("disabled") {
+    if thinking_type == "disabled" || effort.eq_ignore_ascii_case("none") {
+        object.insert("thinking".into(), json!({"type": "disabled"}));
+        object.remove("reasoning_effort");
         return false;
     }
-    let effort = body
-        .get("reasoning_effort")
-        .or_else(|| body.get("reasoningEffort"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    !effort.trim().eq_ignore_ascii_case("none")
+    // 目录明确标注不支持推理的模型不注入默认档；元数据缺失按可推理处理
+    // （官方客户端对 supportsReasoning 缺省同样走兜底档位）。此时仅在
+    // 客户端显式表达思考意图时按开启处理。
+    if model_metadata
+        .and_then(|meta| meta.extensions.get("reasoning"))
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        return thinking_type == "enabled" || !effort.is_empty();
+    }
+    let thinking = object.entry("thinking".to_owned()).or_insert_with(|| json!({}));
+    if !thinking.is_object() {
+        *thinking = json!({});
+    }
+    thinking
+        .as_object_mut()
+        .expect("thinking is an object")
+        .entry("type".to_owned())
+        .or_insert_with(|| json!("enabled"));
+    if object.get("reasoning_effort").is_none() {
+        let default_effort = model_metadata
+            .and_then(|meta| meta.extensions.get("reasoning_default_effort"))
+            .and_then(Value::as_str)
+            .unwrap_or("high");
+        object.insert("reasoning_effort".into(), json!(default_effort));
+    }
+    object
+        .entry("reasoning_summary".to_owned())
+        .or_insert_with(|| json!("auto"));
+    true
 }
 
 /// 上游错误码 11155：思考开启或
@@ -796,6 +836,104 @@ mod tests {
         let mut interpreter = interpreter();
         decode_all(&mut interpreter, &[b"data: [DONE]\n\n"]);
         assert!(!interpreter.terminated);
+    }
+
+    fn metadata(extensions: &[(&str, Value)]) -> ModelMetadata {
+        ModelMetadata {
+            id: None,
+            family: None,
+            selector: None,
+            capabilities: Vec::new(),
+            extensions: extensions
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), value.clone()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn deepseek_default_enables_thinking_with_fallback_effort() {
+        // 什么都没指定时按官方形态注入：思考标记 + 兜底档 + summary。
+        let mut body = json!({"model": "deepseek-v4.1-flash"});
+        assert!(serialize_deepseek_thinking(&mut body, None));
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["reasoning_summary"], "auto");
+    }
+
+    #[test]
+    fn deepseek_client_effort_is_preserved() {
+        let mut body = json!({
+            "model": "deepseek-v4.1-flash",
+            "reasoning_effort": "low",
+        });
+        assert!(serialize_deepseek_thinking(&mut body, None));
+        assert_eq!(body["reasoning_effort"], "low");
+        assert_eq!(body["thinking"]["type"], "enabled");
+    }
+
+    #[test]
+    fn deepseek_catalog_default_effort_wins_over_fallback() {
+        // 目录声明 defaultEffort 的模型，缺省注入取目录值而非 "high"。
+        let meta = metadata(&[("reasoning_default_effort", json!("medium"))]);
+        let mut body = json!({"model": "deepseek-v3-2-volc"});
+        assert!(serialize_deepseek_thinking(&mut body, Some(&meta)));
+        assert_eq!(body["reasoning_effort"], "medium");
+    }
+
+    #[test]
+    fn deepseek_effort_none_serializes_as_disabled() {
+        // 宿主 off 档映射为 reasoning_effort="none"：官方形态是
+        // thinking:{type:"disabled"} 且删除 effort 字段。
+        let mut body = json!({
+            "model": "deepseek-v4.1-flash",
+            "reasoning_effort": "none",
+        });
+        assert!(!serialize_deepseek_thinking(&mut body, None));
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("reasoning_summary").is_none());
+    }
+
+    #[test]
+    fn deepseek_disabled_type_drops_effort() {
+        let mut body = json!({
+            "model": "deepseek-v4.1-flash",
+            "thinking": {"type": "disabled"},
+            "reasoning_effort": "high",
+        });
+        assert!(!serialize_deepseek_thinking(&mut body, None));
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn deepseek_camel_effort_merges_into_snake() {
+        let mut body = json!({
+            "model": "deepseek-v4.1-flash",
+            "reasoningEffort": "max",
+        });
+        assert!(serialize_deepseek_thinking(&mut body, None));
+        assert_eq!(body["reasoning_effort"], "max");
+        assert!(body.get("reasoningEffort").is_none());
+    }
+
+    #[test]
+    fn deepseek_non_reasoning_model_gets_no_injection() {
+        // 目录标注 supportsReasoning=false：不造默认档；无显式意图时
+        // 返回 false，历史回填交给 has_trace 门槛。
+        let meta = metadata(&[("reasoning", json!(false))]);
+        let mut body = json!({"model": "deepseek-v3-0324"});
+        assert!(!serialize_deepseek_thinking(&mut body, Some(&meta)));
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+        // 显式开启仍尊重客户端。
+        let mut body = json!({
+            "model": "deepseek-v3-0324",
+            "reasoning_effort": "low",
+        });
+        assert!(serialize_deepseek_thinking(&mut body, Some(&meta)));
+        assert_eq!(body["reasoning_effort"], "low");
     }
 
     #[test]
