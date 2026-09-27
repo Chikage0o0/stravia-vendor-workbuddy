@@ -1546,7 +1546,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stravia-protocol-codec"
 version = "0.3.0"
-source = "git+https://github.com/Stravia-AI/StraviaPlatform.git?rev=25a21676ba2e5cd9989479972c70d32f1ca11f4a#25a21676ba2e5cd9989479972c70d32f1ca11f4a"
+source = "git+https://github.com/Stravia-AI/StraviaPlatform.git?rev=37458e477ff74bee6700f9faa530f2ab8c97052e#37458e477ff74bee6700f9faa530f2ab8c97052e"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1562,7 +1562,7 @@ dependencies = [
 [[package]]
 name = "stravia-runtime-contract"
 version = "0.3.0"
-source = "git+https://github.com/Stravia-AI/StraviaPlatform.git?rev=25a21676ba2e5cd9989479972c70d32f1ca11f4a#25a21676ba2e5cd9989479972c70d32f1ca11f4a"
+source = "git+https://github.com/Stravia-AI/StraviaPlatform.git?rev=37458e477ff74bee6700f9faa530f2ab8c97052e#37458e477ff74bee6700f9faa530f2ab8c97052e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1581,7 +1581,7 @@ dependencies = [
 [[package]]
 name = "stravia-vendor-common"
 version = "0.3.0"
-source = "git+https://github.com/Stravia-AI/StraviaPlatform.git?rev=25a21676ba2e5cd9989479972c70d32f1ca11f4a#25a21676ba2e5cd9989479972c70d32f1ca11f4a"
+source = "git+https://github.com/Stravia-AI/StraviaPlatform.git?rev=37458e477ff74bee6700f9faa530f2ab8c97052e#37458e477ff74bee6700f9faa530f2ab8c97052e"
 dependencies = [
  "chrono",
  "http",
@@ -1594,7 +1594,7 @@ dependencies = [
 [[package]]
 name = "stravia-vendor-runtime"
 version = "0.3.0"
-source = "git+https://github.com/Stravia-AI/StraviaPlatform.git?rev=25a21676ba2e5cd9989479972c70d32f1ca11f4a#25a21676ba2e5cd9989479972c70d32f1ca11f4a"
+source = "git+https://github.com/Stravia-AI/StraviaPlatform.git?rev=37458e477ff74bee6700f9faa530f2ab8c97052e#37458e477ff74bee6700f9faa530f2ab8c97052e"
 dependencies = [
  "async-trait",
  "serde",
@@ -1610,7 +1610,7 @@ dependencies = [
 [[package]]
 name = "stravia-vendor-sdk"
 version = "0.3.0"
-source = "git+https://github.com/Stravia-AI/StraviaPlatform.git?rev=25a21676ba2e5cd9989479972c70d32f1ca11f4a#25a21676ba2e5cd9989479972c70d32f1ca11f4a"
+source = "git+https://github.com/Stravia-AI/StraviaPlatform.git?rev=37458e477ff74bee6700f9faa530f2ab8c97052e#37458e477ff74bee6700f9faa530f2ab8c97052e"
 dependencies = [
  "base64",
  "semver",
