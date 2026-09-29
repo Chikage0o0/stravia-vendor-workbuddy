@@ -166,6 +166,30 @@ fn curated_catalog(rows: &[Value]) -> Vec<Value> {
     curated.into_iter().cloned().collect()
 }
 
+/// 官方客户端的关思考判定：`onlyReasoning` 的模型恒推理；否则仅当
+/// `reasoning.canDisableThinking` 未显式为 false 时可关。
+fn can_disable_thinking(row: &Value) -> bool {
+    row.get("onlyReasoning").and_then(Value::as_bool) != Some(true)
+        && row
+            .pointer("/reasoning/canDisableThinking")
+            .and_then(Value::as_bool)
+            != Some(false)
+}
+
+/// 目录的 supportedEfforts 不含关闭档。可关思考的模型补 "none"，宿主才会
+/// 把 off 生成为 `reasoning_effort:"none"`（否则 off 档被隐藏）；
+/// 不可关的模型保持原档位表，off 对其不可见。
+fn effort_values(row: &Value, efforts: &[Value]) -> Vec<Value> {
+    let mut values = efforts.to_vec();
+    let has_none = values
+        .iter()
+        .any(|value| value.as_str().is_some_and(|v| v.eq_ignore_ascii_case("none")));
+    if can_disable_thinking(row) && !has_none {
+        values.insert(0, json!("none"));
+    }
+    values
+}
+
 fn parse_models(rows: &[Value], source: &str) -> Result<DiscoverResponse, PluginError> {
     let mut models = Vec::with_capacity(rows.len());
     let mut seen = BTreeSet::new();
@@ -224,7 +248,7 @@ fn parse_models(rows: &[Value], source: &str) -> Result<DiscoverResponse, Plugin
         {
             metadata.insert(
                 "reasoning_options".into(),
-                json!([{"type":"effort", "values":efforts}]),
+                json!([{"type":"effort", "values":effort_values(row, efforts)}]),
             );
         }
         // 目录的 reasoning.effort 是固定档、defaultEffort 是默认档；
@@ -288,6 +312,32 @@ mod tests {
             .map(|row| row["id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, ["auto", "hy3-x", "glm-5.3"]);
+    }
+
+    #[test]
+    fn off_level_is_advertised_only_for_models_that_can_disable_thinking() {
+        let rows: Vec<Value> = serde_json::from_str(
+            r#"[
+            {"id":"deepseek-v4-pro","onlyReasoning":false,"supportsReasoning":true,
+             "reasoning":{"canDisableThinking":true,"supportedEfforts":["high","xhigh"]}},
+            {"id":"glm-5.3","onlyReasoning":true,"supportsReasoning":true,
+             "reasoning":{"canDisableThinking":true,"supportedEfforts":["low","high","max"]}},
+            {"id":"hy3","onlyReasoning":true,"supportsReasoning":true,
+             "reasoning":{"canDisableThinking":false,"supportedEfforts":["low","high"]}},
+            {"id":"x-nodisable","onlyReasoning":false,"supportsReasoning":true,
+             "reasoning":{"canDisableThinking":false,"supportedEfforts":["high"]}}
+        ]"#,
+        )
+        .unwrap();
+        let models = parse_models(&rows, "test").unwrap().models;
+        let values = |id: &str| {
+            let model = models.iter().find(|model| model.id == id).unwrap();
+            model.metadata["reasoning_options"][0]["values"].clone()
+        };
+        assert_eq!(values("deepseek-v4-pro"), json!(["none", "high", "xhigh"]));
+        assert_eq!(values("glm-5.3"), json!(["low", "high", "max"]));
+        assert_eq!(values("hy3"), json!(["low", "high"]));
+        assert_eq!(values("x-nodisable"), json!(["high"]));
     }
 
     #[test]

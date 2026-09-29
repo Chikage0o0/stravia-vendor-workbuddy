@@ -90,8 +90,12 @@ fn normalize_request_body(body: &mut Value, model_metadata: Option<&ModelMetadat
         .and_then(Value::as_str)
         .is_some_and(|model| model.to_ascii_lowercase().starts_with("deepseek"));
     // 思考字段先落成最终线上形态，历史回填门槛以序列化结果为准。
-    let thinking_enabled =
-        is_deepseek && serialize_deepseek_thinking(body, model_metadata);
+    let thinking_enabled = if is_deepseek {
+        serialize_deepseek_thinking(body, model_metadata)
+    } else {
+        drop_none_effort(body);
+        false
+    };
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
@@ -200,6 +204,22 @@ fn translate_max_completion_tokens(body: &mut Value) {
         .or_else(|| alias.as_str().and_then(|s| s.trim().parse().ok()));
     if let Some(value) = parsed.filter(|value| *value > 0) {
         object.insert("max_tokens".into(), Value::from(value));
+    }
+}
+
+/// 非 deepseek 模型的关思考：上游档位表没有 "none"，官方客户端关思考时
+/// 只是不发 reasoning 字段；宿主 off 档产出的 `reasoning_effort:"none"`
+/// 在此还原成同样的线规形态。
+fn drop_none_effort(body: &mut Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    if object
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .is_some_and(|effort| effort.trim().eq_ignore_ascii_case("none"))
+    {
+        object.remove("reasoning_effort");
     }
 }
 
@@ -893,6 +913,26 @@ mod tests {
         assert_eq!(body["thinking"]["type"], "disabled");
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("reasoning_summary").is_none());
+    }
+
+    #[test]
+    fn non_deepseek_effort_none_is_dropped_but_real_effort_kept() {
+        let mut body = json!({
+            "model": "glm-4.6",
+            "reasoning_effort": "none",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        normalize_request_body(&mut body, None);
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("thinking").is_none());
+
+        let mut body = json!({
+            "model": "glm-5.3",
+            "reasoning_effort": "high",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        normalize_request_body(&mut body, None);
+        assert_eq!(body["reasoning_effort"], "high");
     }
 
     #[test]
