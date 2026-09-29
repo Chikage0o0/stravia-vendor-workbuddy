@@ -12,7 +12,6 @@ use stravia_protocol_codec::accumulator::StreamResponseAccumulator;
 use stravia_protocol_codec::transform::{ProtocolTransform, StreamDecodeStage};
 use stravia_runtime_contract::protocol::ids::ProtocolEndpoint;
 use stravia_runtime_contract::protocol::ir::AiRequest;
-use stravia_runtime_contract::protocol::ir::ProtocolExt;
 use stravia_vendor_common::common;
 use stravia_vendor_sdk::{
     AiErrorKind, AiStreamDelta, ErrorKind, GuestHost, HttpRequest, HttpResponse, ModelMetadata,
@@ -64,7 +63,7 @@ pub(crate) fn execute(
     set_header(&mut headers, "content-type", "application/json");
     set_header(&mut headers, "accept", "text/event-stream");
     set_header(&mut headers, "x-model-id", model);
-    apply_session_headers(&mut headers, &request, provider, region);
+    apply_session_headers(&mut headers, provider, region);
     host.emit_started()?;
     let response = host.http_start(HttpRequest {
         method: "POST".into(),
@@ -82,15 +81,15 @@ fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
 
 /// 官方客户端为推理请求注入的会话链与 OTel 传播标头。
 ///
-/// `X-Conversation-ID` 是上游网关做前缀缓存亲和的稳定路由键，只采用
-/// 客户端显式给出的会话键，缺失时不伪造随机值——每请求一枚随机
-/// 会话键会进一步打散上游的亲和视图，比缺失更差。
+/// `X-Conversation-ID` 是上游网关做前缀缓存亲和的稳定路由键，取宿主按
+/// 本地链路派生的 `operation_metadata.session_affinity`（64 位 hex，同一
+/// 链路各轮不变），不采用客户端自报的 session。缺失时不伪造随机值——
+/// 每请求一枚随机会话键会进一步打散上游的亲和视图，比缺失更差。
 ///
 /// 官方线规中 `X-Request-ID` 与 `X-Conversation-Message-ID` 同为每轮
 /// 生成的 messageId，这里共用一枚；轮次级 ID 由插件生成，语义等价。
 fn apply_session_headers(
     headers: &mut Vec<(String, String)>,
-    request: &AiRequest,
     provider: &ProviderSnapshot,
     region: Region,
 ) {
@@ -102,14 +101,18 @@ fn apply_session_headers(
         "x-conversation-request-id",
         &uuid::Uuid::new_v4().simple().to_string(),
     );
-    if let Some(conversation_id) = conversation_key(request, provider) {
-        set_header(headers, "x-conversation-id", &conversation_id);
+    if let Some(conversation_id) = provider
+        .operation_metadata
+        .get("session_affinity")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        set_header(headers, "x-conversation-id", conversation_id);
         set_header(
             headers,
             "baggage",
             &format!(
-                "codebuddy.session_id={},codebuddy.conversation_request_id={message_id}",
-                baggage_value(&conversation_id),
+                "codebuddy.session_id={conversation_id},codebuddy.conversation_request_id={message_id}"
             ),
         );
     }
@@ -126,82 +129,6 @@ fn apply_session_headers(
     set_header(headers, "x-b3-spanid", &span_id);
     set_header(headers, "x-b3-sampled", "1");
     set_header(headers, "x-product-version", region.version());
-}
-
-/// 提取客户端显式声明的稳定会话键，优先级与宿主 session 解析一致：
-/// 宿主归一化结果 `__stravia_generation_session_id`（已覆盖全部入站协议的
-/// session 标头与 `prompt_cache_key`）→ Responses `prompt_cache_key` /
-/// `safety_identifier` → 其它协议入站透传的同名 body 字段 → 宿主白名单内
-/// 的 session 标头。
-///
-/// `__stravia_*` 前缀字段按约定不进上游 body；此处取用其值填入会话标头，
-/// 正是该字段的存在目的。
-fn conversation_key(request: &AiRequest, provider: &ProviderSnapshot) -> Option<String> {
-    if let Some(key) = request
-        .meta
-        .vendor
-        .ingress
-        .get("__stravia_generation_session_id")
-        .and_then(Value::as_str)
-        .and_then(|value| sanitize_session_key(Some(value)))
-    {
-        return Some(key);
-    }
-    if let Some(ProtocolExt::OpenResponses(ext)) = request.ext.as_ref() {
-        for value in [
-            ext.prompt_cache_key.as_deref(),
-            ext.safety_identifier.as_deref(),
-        ] {
-            if let Some(key) = sanitize_session_key(value) {
-                return Some(key);
-            }
-        }
-    }
-    for field in ["prompt_cache_key", "safety_identifier"] {
-        if let Some(key) = request
-            .meta
-            .vendor
-            .ingress
-            .get(field)
-            .and_then(Value::as_str)
-            .and_then(|value| sanitize_session_key(Some(value)))
-        {
-            return Some(key);
-        }
-    }
-    for (name, value) in &provider.client_headers {
-        if matches!(
-            name.as_str(),
-            "session-id" | "session_id" | "conversation_id" | "thread-id"
-        ) && let Some(key) = sanitize_session_key(Some(value))
-        {
-            return Some(key);
-        }
-    }
-    None
-}
-
-/// 会话键必须能安全进入标头值：可见 ASCII、非空、有界。
-fn sanitize_session_key(value: Option<&str>) -> Option<String> {
-    let value = value?.trim();
-    (!value.is_empty()
-        && value.len() <= 128
-        && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte)))
-    .then(|| value.to_owned())
-}
-
-/// W3C baggage 值只允许 token 字符；其余按百分号编码，防止 `,`/`;`/`=`
-/// 这类分隔符把一个键值拆坏整个标头。
-fn baggage_value(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
 }
 
 /// 编码后请求体的线规修正，逐项对应上游校验错误码：
@@ -1128,67 +1055,31 @@ mod tests {
     }
 
     #[test]
-    fn conversation_id_prefers_responses_prompt_cache_key() {
-        let mut request = AiRequest::new("hy4-preview", Vec::new());
-        request.ext = Some(ProtocolExt::OpenResponses(
-            stravia_runtime_contract::protocol::ir::OpenResponsesExt {
-                prompt_cache_key: Some("conv-123".into()),
-                ..Default::default()
-            },
-        ));
-        let provider = session_provider(&[("session_id", "other")]);
+    fn conversation_id_uses_host_session_affinity() {
+        let affinity = "0123456789abcdef".repeat(4);
+        let mut provider = session_provider(&[("session_id", "client-session")]);
+        provider
+            .operation_metadata
+            .insert("session_affinity".into(), Value::String(affinity.clone()));
         let mut headers = Vec::new();
-        apply_session_headers(&mut headers, &request, &provider, Region::Cn);
+        apply_session_headers(&mut headers, &provider, Region::Cn);
         assert_eq!(
             header_value(&headers, "x-conversation-id"),
-            Some("conv-123")
+            Some(affinity.as_str())
         );
         assert!(
             header_value(&headers, "baggage")
-                .is_some_and(|v| v.starts_with("codebuddy.session_id=conv-123,"))
+                .is_some_and(|v| v.starts_with(&format!("codebuddy.session_id={affinity},")))
         );
     }
 
     #[test]
-    fn conversation_id_prefers_host_resolved_session() {
-        // 宿主已把任意入站协议的 session 键归一化到 vendor.ingress；
-        // 它优先于插件侧逐字段回读。
-        let mut request = AiRequest::new("hy4-preview", Vec::new());
-        request.meta.vendor.ingress.insert(
-            "__stravia_generation_session_id".into(),
-            Value::String("host-session".into()),
-        );
-        request.ext = Some(ProtocolExt::OpenResponses(
-            stravia_runtime_contract::protocol::ir::OpenResponsesExt {
-                prompt_cache_key: Some("other".into()),
-                ..Default::default()
-            },
-        ));
-        let provider = session_provider(&[]);
+    fn conversation_id_absent_without_host_affinity() {
+        // 客户端自报的 session 不作为上游键；宿主未下发时也不伪造——
+        // 随机会话键只会打散上游亲和视图。
+        let provider = session_provider(&[("session_id", "client-session")]);
         let mut headers = Vec::new();
-        apply_session_headers(&mut headers, &request, &provider, Region::Cn);
-        assert_eq!(
-            header_value(&headers, "x-conversation-id"),
-            Some("host-session")
-        );
-    }
-
-    #[test]
-    fn conversation_id_falls_back_to_client_session_header() {
-        let request = AiRequest::new("hy4-preview", Vec::new());
-        let provider = session_provider(&[("session_id", "sess-9")]);
-        let mut headers = Vec::new();
-        apply_session_headers(&mut headers, &request, &provider, Region::Cn);
-        assert_eq!(header_value(&headers, "x-conversation-id"), Some("sess-9"));
-    }
-
-    #[test]
-    fn conversation_id_absent_without_client_key() {
-        // 没有显式会话键时不伪造：随机会话键只会打散上游亲和视图。
-        let request = AiRequest::new("hy4-preview", Vec::new());
-        let provider = session_provider(&[]);
-        let mut headers = Vec::new();
-        apply_session_headers(&mut headers, &request, &provider, Region::Cn);
+        apply_session_headers(&mut headers, &provider, Region::Cn);
         assert!(header_value(&headers, "x-conversation-id").is_none());
         assert!(header_value(&headers, "baggage").is_none());
         // 轮次级与追踪标头仍然齐备。
@@ -1199,20 +1090,18 @@ mod tests {
 
     #[test]
     fn request_id_matches_message_id_like_the_official_client() {
-        let request = AiRequest::new("hy4-preview", Vec::new());
         let provider = session_provider(&[]);
         let mut headers = Vec::new();
-        apply_session_headers(&mut headers, &request, &provider, Region::Cn);
+        apply_session_headers(&mut headers, &provider, Region::Cn);
         let message = header_value(&headers, "x-conversation-message-id").unwrap();
         assert_eq!(header_value(&headers, "x-request-id"), Some(message));
     }
 
     #[test]
     fn trace_headers_form_a_valid_w3c_pair() {
-        let request = AiRequest::new("hy4-preview", Vec::new());
         let provider = session_provider(&[]);
         let mut headers = Vec::new();
-        apply_session_headers(&mut headers, &request, &provider, Region::Cn);
+        apply_session_headers(&mut headers, &provider, Region::Cn);
         let traceparent = header_value(&headers, "traceparent").unwrap();
         let trace_id = header_value(&headers, "x-trace-id").unwrap();
         assert_eq!(trace_id.len(), 32);
@@ -1222,41 +1111,6 @@ mod tests {
         assert_eq!(parts[2].len(), 16);
         assert_eq!(header_value(&headers, "x-b3-traceid"), Some(trace_id));
         assert_eq!(header_value(&headers, "x-b3-spanid"), Some(parts[2]));
-    }
-
-    #[test]
-    fn baggage_encodes_separators_in_session_key() {
-        // 键值必须不能拆坏 baggage 标头：`,;=` 一律百分号编码。
-        let mut request = AiRequest::new("hy4-preview", Vec::new());
-        request.ext = Some(ProtocolExt::OpenResponses(
-            stravia_runtime_contract::protocol::ir::OpenResponsesExt {
-                prompt_cache_key: Some("a,b=c".into()),
-                ..Default::default()
-            },
-        ));
-        let provider = session_provider(&[]);
-        let mut headers = Vec::new();
-        apply_session_headers(&mut headers, &request, &provider, Region::Cn);
-        let baggage = header_value(&headers, "baggage").unwrap();
-        assert!(baggage.starts_with("codebuddy.session_id=a%2Cb%3Dc,"));
-        // 原始未编码键仍进入 X-Conversation-ID（标头值本身允许这些字符）。
-        assert_eq!(header_value(&headers, "x-conversation-id"), Some("a,b=c"));
-    }
-
-    #[test]
-    fn injected_session_key_is_dropped() {
-        let mut request = AiRequest::new("hy4-preview", Vec::new());
-        request.ext = Some(ProtocolExt::OpenResponses(
-            stravia_runtime_contract::protocol::ir::OpenResponsesExt {
-                prompt_cache_key: Some("ok\r\nX-Injected: 1".into()),
-                ..Default::default()
-            },
-        ));
-        let provider = session_provider(&[]);
-        let mut headers = Vec::new();
-        apply_session_headers(&mut headers, &request, &provider, Region::Cn);
-        assert!(header_value(&headers, "x-conversation-id").is_none());
-        assert!(header_value(&headers, "baggage").is_none());
     }
 
     #[test]
