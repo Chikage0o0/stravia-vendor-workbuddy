@@ -4,7 +4,10 @@
   "channel_cn_description": "Use a mainland WorkBuddy account with browser authorization. Models are discovered from this account's /v3/config; no quota check is performed.",
   "channel_intl_description": "Use an international WorkBuddy AI account with browser authorization. Models are discovered from this account's /v3/config.",
   "model_ids": "Custom model IDs",
-  "model_ids_description": "Optional, one model ID per line. When set, only these explicitly configured models are synchronized. Otherwise models are discovered from the account's /v3/config. No quota check or model call is performed.",
+  "model_ids_description": "Optional, one model ID per line. When set, only these exact IDs are synchronized. Otherwise discovery follows the account's default-agent roster in /v3/config and merges free/paid lines. Discovery does not call models or check quotas; automatic paid inference is controlled by a separate option.",
   "invalid_model_ids": "Model IDs must be nonempty single-line text, at most 200 characters each, with no control characters or duplicates.",
+  "auto_paid_on_rate_limit": "Automatically use paid lines after rate limits",
+  "auto_paid_on_rate_limit_description": "Off by default. Enabling authorizes automatic use of the configured paid line, consuming credits, after a free line returns rate-limit code 6004. Switches once only before response output; returns to the free line when the rate-limit window expires.",
+  "invalid_auto_paid_on_rate_limit": "The automatic paid-line option must be a boolean.",
   "invalid_options": "Unsupported WorkBuddy configuration fields were provided."
 }

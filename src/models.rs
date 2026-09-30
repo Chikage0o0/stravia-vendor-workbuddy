@@ -39,11 +39,24 @@ fn configured_ids(options: &BTreeMap<String, Value>) -> Result<Vec<&str>, ()> {
 
 pub(crate) fn validate(options: &BTreeMap<String, Value>) -> ConfigValidationResponse {
     let mut issues = Vec::new();
-    if options.keys().any(|key| key != "model_ids") {
+    if options
+        .keys()
+        .any(|key| key != "model_ids" && key != "auto_paid_on_rate_limit")
+    {
         issues.push(ValidationIssue {
             field: None,
             code: "unknown_option".into(),
             message: messages::invalid_options(),
+        });
+    }
+    if options
+        .get("auto_paid_on_rate_limit")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        issues.push(ValidationIssue {
+            field: Some("auto_paid_on_rate_limit".into()),
+            code: "invalid_auto_paid_on_rate_limit".into(),
+            message: messages::invalid_auto_paid_on_rate_limit(),
         });
     }
     if configured_ids(options).is_err() {
@@ -90,6 +103,15 @@ pub(crate) fn discover(
         let rows: Vec<Value> = ids.into_iter().map(|id| json!({"id": id})).collect();
         return parse_models(&rows, "administrator");
     }
+    let config = load_config(host, region, headers)?;
+    client_catalog(&config)
+}
+
+fn load_config(
+    host: &GuestHost,
+    region: Region,
+    headers: Vec<(String, String)>,
+) -> Result<Value, PluginError> {
     let response = host.http_start(HttpRequest {
         method: "GET".into(),
         url: format!("{}/v3/config", region.origin()),
@@ -104,7 +126,7 @@ pub(crate) fn discover(
         error.message = format!("WorkBuddy model discovery HTTP {status}");
         return Err(error);
     }
-    let payload: Value = serde_json::from_slice(&body).map_err(|_| {
+    let mut payload: Value = serde_json::from_slice(&body).map_err(|_| {
         common::plugin_error(
             ErrorKind::upstream_unknown(),
             "invalid WorkBuddy model configuration JSON",
@@ -119,51 +141,202 @@ pub(crate) fn discover(
             "WorkBuddy model configuration returned an error",
         ));
     }
-    let config = payload.get("data").unwrap_or(&payload);
-    let rows = config
+    if let Some(data) = payload
+        .as_object_mut()
+        .and_then(|object| object.remove("data"))
+    {
+        Ok(data)
+    } else {
+        Ok(payload)
+    }
+}
+
+fn catalog_rows(config: &Value) -> Result<&[Value], PluginError> {
+    config
         .get("models")
         .and_then(Value::as_array)
+        .map(Vec::as_slice)
         .ok_or_else(|| {
             common::plugin_error(
                 ErrorKind::upstream_unknown(),
                 "WorkBuddy configuration has no models array",
             )
-        })?;
-    parse_models(&curated_catalog(rows), "account-config")
+        })
 }
 
-/// 服务端下发的是全量后端目录，包含内部功能模型与同名部署变体。
-/// 只保留带计费标签或标记为默认的条目；同名变体按 iconUrl 优先去重。
-/// 过滤结果为空（目录结构变化或特殊账号形态）时回退全量列表。
-fn curated_catalog(rows: &[Value]) -> Vec<Value> {
-    let visible = |row: &Value| {
-        row.get("credits").is_some_and(|v| match v {
-            Value::String(s) => !s.trim().is_empty(),
-            Value::Null => false,
-            _ => true,
-        }) || row.get("isDefault") == Some(&Value::Bool(true))
+fn paid_lines(config: &Value) -> Result<BTreeMap<String, Value>, PluginError> {
+    let rows = catalog_rows(config)?;
+    let Some(lines) = config
+        .pointer("/productFeaturesConfig/ModelRateLimitCap/lines")
+        .and_then(Value::as_array)
+    else {
+        return Ok(BTreeMap::new());
     };
-    let mut curated: Vec<&Value> = Vec::new();
-    let mut slots: BTreeMap<&str, usize> = BTreeMap::new();
-    for row in rows.iter().filter(|row| visible(row)) {
-        let name = row.get("name").and_then(Value::as_str).unwrap_or_default();
-        match slots.get(name).copied() {
-            None => {
-                slots.insert(name, curated.len());
-                curated.push(row);
+    let mut pairs = BTreeMap::new();
+    let mut used_ids = BTreeSet::new();
+    for line in lines {
+        let (Some(free), Some(paid)) = (
+            line.get("freeId").and_then(Value::as_str),
+            line.get("paidId").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let allow = match line.get("allowPaidSwitch") {
+            None => false,
+            Some(Value::Bool(allow)) => *allow,
+            Some(_) => continue,
+        };
+        if free == paid || !valid_id(free) || !valid_id(paid) {
+            continue;
+        }
+        let find = |id: &str| {
+            rows.iter()
+                .find(|row| row.get("id").and_then(Value::as_str) == Some(id))
+        };
+        let (Some(_), Some(paid_row)) = (find(free), find(paid)) else {
+            continue;
+        };
+        // 配对冲突时无法明确授权付费目的地，必须拒绝而不是猜测。
+        if used_ids.contains(free) || used_ids.contains(paid) {
+            return Err(common::plugin_error(
+                ErrorKind::upstream_unknown(),
+                "ambiguous WorkBuddy model rate-limit lines",
+            ));
+        }
+        used_ids.insert(free);
+        used_ids.insert(paid);
+        let paid_model = parse_models(std::slice::from_ref(paid_row), "account-config")?
+            .models
+            .remove(0);
+        pairs.insert(
+            free.into(),
+            json!({
+                "freeId": free, "paidId": paid, "allowPaidSwitch": allow,
+                "displayName": line.get("displayName").and_then(Value::as_str),
+                "paidMetadata": paid_model.metadata,
+            }),
+        );
+    }
+    Ok(pairs)
+}
+
+pub(crate) fn paid_line(
+    host: &GuestHost,
+    provider: &ProviderSnapshot,
+    region: Region,
+    free_id: &str,
+) -> Result<Option<Value>, PluginError> {
+    let config = load_config(host, region, auth::headers(provider, region)?)?;
+    Ok(paid_lines(&config)?.remove(free_id))
+}
+
+fn client_catalog(config: &Value) -> Result<DiscoverResponse, PluginError> {
+    let rows = catalog_rows(config)?;
+    let agents = config
+        .get("agents")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            common::plugin_error(
+                ErrorKind::upstream_unknown(),
+                "WorkBuddy configuration has no client model list",
+            )
+        })?;
+    let nonempty = |agent: &&Value| {
+        agent
+            .get("models")
+            .and_then(Value::as_array)
+            .is_some_and(|models| !models.is_empty())
+    };
+    let agent = agents
+        .iter()
+        .find(|agent| {
+            agent
+                .get("tags")
+                .and_then(Value::as_array)
+                .is_some_and(|tags| tags.iter().any(|tag| tag.as_str() == Some("default")))
+        })
+        .or_else(|| {
+            agents
+                .iter()
+                .find(|agent| agent.get("name").and_then(Value::as_str) == Some("cli"))
+        })
+        .or_else(|| agents.iter().find(nonempty))
+        .ok_or_else(|| {
+            common::plugin_error(
+                ErrorKind::upstream_unknown(),
+                "WorkBuddy configuration has no client model list",
+            )
+        })?;
+    let pairs = paid_lines(config)?;
+    let mut selected = Vec::new();
+    let mut seen = BTreeSet::new();
+    let agent_models = agent
+        .get("models")
+        .and_then(Value::as_array)
+        .filter(|models| !models.is_empty())
+        .ok_or_else(|| {
+            common::plugin_error(
+                ErrorKind::upstream_unknown(),
+                "WorkBuddy configuration has no client model list",
+            )
+        })?;
+    for entry in agent_models {
+        let name = entry.as_str().ok_or_else(|| {
+            common::plugin_error(
+                ErrorKind::upstream_unknown(),
+                "invalid WorkBuddy client model list",
+            )
+        })?;
+        if let Some(row) = rows
+            .iter()
+            .find(|row| row.get("id").and_then(Value::as_str) == Some(name))
+            .or_else(|| {
+                rows.iter()
+                    .find(|row| row.get("name").and_then(Value::as_str) == Some(name))
+            })
+        {
+            let id = row.get("id").and_then(Value::as_str).ok_or_else(|| {
+                common::plugin_error(
+                    ErrorKind::upstream_unknown(),
+                    "model catalog entry has no ID",
+                )
+            })?;
+            let free = pairs
+                .iter()
+                .find(|(_, line)| line["paidId"].as_str() == Some(id))
+                .map(|(free, _)| free.as_str())
+                .unwrap_or(id);
+            if seen.insert(free.to_owned()) {
+                let free_row = rows
+                    .iter()
+                    .find(|row| row.get("id").and_then(Value::as_str) == Some(free))
+                    .unwrap_or(row);
+                selected.push(free_row);
             }
-            Some(i)
-                if curated[i].get("iconUrl").is_none() && row.get("iconUrl").is_some() =>
-            {
-                curated[i] = row;
-            }
-            _ => {}
         }
     }
-    if curated.is_empty() {
-        return rows.to_vec();
+    if selected.is_empty() {
+        return Err(common::plugin_error(
+            ErrorKind::upstream_unknown(),
+            "WorkBuddy client model list has no catalog matches",
+        ));
     }
-    curated.into_iter().cloned().collect()
+    let mut response = parse_models(selected, "account-config")?;
+    for model in &mut response.models {
+        if let Some(line) = pairs.get(&model.id) {
+            if let Some(name) = line
+                .get("displayName")
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+            {
+                name.clone_into(&mut model.display_name);
+            }
+            model
+                .metadata
+                .insert("workbuddy_paid_line".into(), line.clone());
+        }
+    }
+    Ok(response)
 }
 
 /// 官方客户端的关思考判定：`onlyReasoning` 的模型恒推理；否则仅当
@@ -181,17 +354,23 @@ fn can_disable_thinking(row: &Value) -> bool {
 /// 不可关的模型保持原档位表，off 对其不可见。
 fn effort_values(row: &Value, efforts: &[Value]) -> Vec<Value> {
     let mut values = efforts.to_vec();
-    let has_none = values
-        .iter()
-        .any(|value| value.as_str().is_some_and(|v| v.eq_ignore_ascii_case("none")));
+    let has_none = values.iter().any(|value| {
+        value
+            .as_str()
+            .is_some_and(|v| v.eq_ignore_ascii_case("none"))
+    });
     if can_disable_thinking(row) && !has_none {
         values.insert(0, json!("none"));
     }
     values
 }
 
-fn parse_models(rows: &[Value], source: &str) -> Result<DiscoverResponse, PluginError> {
-    let mut models = Vec::with_capacity(rows.len());
+fn parse_models<'a>(
+    rows: impl IntoIterator<Item = &'a Value>,
+    source: &str,
+) -> Result<DiscoverResponse, PluginError> {
+    let rows = rows.into_iter();
+    let mut models = Vec::with_capacity(rows.size_hint().0);
     let mut seen = BTreeSet::new();
     for row in rows {
         let id = row
@@ -293,28 +472,6 @@ mod tests {
     }
 
     #[test]
-    fn curated_catalog_drops_internal_and_dedupes_deployment_variants() {
-        let rows: Vec<Value> = serde_json::from_str(
-            r#"[
-            {"id":"auto","name":"Auto","isDefault":true},
-            {"id":"hy3","name":"Hy3","credits":"x0.00"},
-            {"id":"hy3-b","name":"Hy3","credits":"x0.00"},
-            {"id":"hy3-x","name":"Hy3","credits":"x0.05","iconUrl":"data:,"},
-            {"id":"glm-5.3","name":"GLM-5.3","credits":"x0.79"},
-            {"id":"codewise-jump","name":"codewise-jump"},
-            {"id":"seedance-2.5","name":"Seedance-2.5","tags":["text-to-video"]}
-        ]"#,
-        )
-        .unwrap();
-        let curated = curated_catalog(&rows);
-        let ids: Vec<&str> = curated
-            .iter()
-            .map(|row| row["id"].as_str().unwrap())
-            .collect();
-        assert_eq!(ids, ["auto", "hy3-x", "glm-5.3"]);
-    }
-
-    #[test]
     fn off_level_is_advertised_only_for_models_that_can_disable_thinking() {
         let rows: Vec<Value> = serde_json::from_str(
             r#"[
@@ -338,14 +495,5 @@ mod tests {
         assert_eq!(values("glm-5.3"), json!(["low", "high", "max"]));
         assert_eq!(values("hy3"), json!(["low", "high"]));
         assert_eq!(values("x-nodisable"), json!(["high"]));
-    }
-
-    #[test]
-    fn curated_catalog_falls_back_when_everything_is_filtered() {
-        let rows: Vec<Value> = serde_json::from_str(
-            r#"[{"id":"a","name":"A"},{"id":"b","name":"B"}]"#,
-        )
-        .unwrap();
-        assert_eq!(curated_catalog(&rows).len(), 2);
     }
 }

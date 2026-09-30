@@ -43,35 +43,299 @@ pub(crate) fn execute(
         .ok_or_else(|| {
             common::plugin_error(ErrorKind::Invalid, "WorkBuddy inference requires a model")
         })?;
-    request.model = model.to_owned();
-    // 上游对话接口只提供 SSE 流式响应；include_usage 由编解码器默认补齐。
-    request.stream.enabled = true;
-    // 凭据中的 region/domain 与请求区域不一致时，auth::headers 会在任何
-    // HTTP 发生前直接失败。
-    let auth_headers = auth::headers(provider, region)?;
-    let encoded = common::encode_inference_request(PROTOCOL, &request)?;
-    let mut body = encoded.body;
-    normalize_request_body(&mut body, provider.model_metadata.as_ref());
-    let body = serde_json::to_vec(&body).map_err(|error| {
-        common::plugin_error(
+    if !crate::models::validate(&provider.options).issues.is_empty() {
+        return Err(common::plugin_error(
             ErrorKind::Invalid,
-            format!("failed to serialize request body: {error}"),
-        )
-    })?;
-    let mut headers = common::header_pairs(&encoded.headers)?;
-    headers.extend(auth_headers);
-    set_header(&mut headers, "content-type", "application/json");
-    set_header(&mut headers, "accept", "text/event-stream");
-    set_header(&mut headers, "x-model-id", model);
-    apply_session_headers(&mut headers, provider, region);
-    host.emit_started()?;
-    let response = host.http_start(HttpRequest {
-        method: "POST".into(),
-        url: format!("{}{CHAT_PATH}", region.origin()),
-        headers,
-        body,
-    })?;
-    decode_response(host, response)
+            "invalid WorkBuddy model options",
+        ));
+    }
+    let enabled = provider
+        .options
+        .get("auto_paid_on_rate_limit")
+        .and_then(Value::as_bool)
+        == Some(true);
+    request.stream.enabled = true;
+    let mut first_auth_headers = Some(auth::headers(provider, region)?);
+    let mut pair = if enabled {
+        provider
+            .model_metadata
+            .as_ref()
+            .and_then(|meta| meta.extensions.get("workbuddy_paid_line"))
+            .cloned()
+    } else {
+        None
+    };
+    let root = if enabled {
+        Some(crate::state::read(host)?)
+    } else {
+        None
+    };
+    if let Some(windows) = root
+        .as_ref()
+        .and_then(|root| root.get("workbuddy_paid_windows"))
+        && !windows
+            .as_object()
+            .is_some_and(|windows| windows.values().all(|reset| reset.as_i64().is_some()))
+    {
+        return Err(common::plugin_error(
+            ErrorKind::Invalid,
+            "stored WorkBuddy paid windows are malformed",
+        ));
+    }
+    let mut pair_lookup_done = false;
+    if pair.is_none()
+        && root
+            .as_ref()
+            .is_some_and(|root| has_active_window(root, provider, region, model))
+    {
+        pair = crate::models::paid_line(host, provider, region, model)?;
+        pair_lookup_done = true;
+    }
+    let mut paid = false;
+    if let (Some(pair), Some(root)) = (pair.as_ref().filter(|pair| valid_pair(pair, model)), &root)
+    {
+        let key = window_key(provider, region, pair);
+        paid = root
+            .get("workbuddy_paid_windows")
+            .and_then(|windows| windows.get(&key))
+            .and_then(Value::as_i64)
+            .is_some_and(|reset| reset > chrono::Utc::now().timestamp_millis());
+    }
+    // 免费频控与付费线路属于同一次逻辑补全；宿主只接收一次 UpstreamStarted。
+    // 第二次传输必须在输出提交前发生，不能递归执行完整推理入口。
+    for attempt in 0..2 {
+        let paid_metadata = if paid {
+            let Some(Value::Object(mut fields)) = pair.take() else {
+                return Err(common::plugin_error(
+                    ErrorKind::Invalid,
+                    "invalid WorkBuddy paid model metadata",
+                ));
+            };
+            let Some(Value::String(paid_id)) = fields.remove("paidId") else {
+                return Err(common::plugin_error(
+                    ErrorKind::Invalid,
+                    "invalid WorkBuddy paid model metadata",
+                ));
+            };
+            request.model = paid_id;
+            let metadata = fields.remove("paidMetadata").ok_or_else(|| {
+                common::plugin_error(ErrorKind::Invalid, "invalid WorkBuddy paid model metadata")
+            })?;
+            // 规范化只消费扩展字段；实际线路 ID 已在 request.model 中，无需复制。
+            Some(ModelMetadata {
+                extensions: serde_json::from_value(metadata).map_err(|_| {
+                    common::plugin_error(
+                        ErrorKind::Invalid,
+                        "invalid WorkBuddy paid model metadata",
+                    )
+                })?,
+                ..Default::default()
+            })
+        } else {
+            request.model = model.to_owned();
+            None
+        };
+        let effective_model = request.model.as_str();
+        let encoded = common::encode_inference_request(PROTOCOL, &request)?;
+        let mut body = encoded.body;
+        normalize_request_body(
+            &mut body,
+            if paid {
+                paid_metadata.as_ref()
+            } else {
+                provider.model_metadata.as_ref()
+            },
+        );
+        let body = serde_json::to_vec(&body).map_err(|error| {
+            common::plugin_error(
+                ErrorKind::Invalid,
+                format!("failed to serialize request body: {error}"),
+            )
+        })?;
+        let mut headers = common::header_pairs(&encoded.headers)?;
+        headers.extend(match first_auth_headers.take() {
+            Some(headers) => headers,
+            None => auth::headers(provider, region)?,
+        });
+        set_header(&mut headers, "content-type", "application/json");
+        set_header(&mut headers, "accept", "text/event-stream");
+        set_header(&mut headers, "x-model-id", effective_model);
+        apply_session_headers(&mut headers, provider, region);
+        if attempt == 0 {
+            host.emit_started()?;
+        }
+        let response = host.http_start(HttpRequest {
+            method: "POST".into(),
+            url: format!("{}{CHAT_PATH}", region.origin()),
+            headers,
+            body,
+        })?;
+        let mut rate_limit = None;
+        let mut deferred_deltas = Vec::new();
+        let result = decode_attempt(
+            host,
+            response,
+            enabled
+                && !paid
+                && attempt == 0
+                && pair.as_ref().is_none_or(|pair| valid_pair(pair, model)),
+            &mut rate_limit,
+            &mut deferred_deltas,
+        );
+        let Some(rate_limit) = rate_limit else {
+            return result;
+        };
+        let reset = reset_at(&rate_limit);
+        // 已到期的频控错误不再授权付费；缺少时间时只允许当前请求切换。
+        if pair.is_none()
+            && !pair_lookup_done
+            && reset.is_none_or(|reset| reset > chrono::Utc::now().timestamp_millis())
+        {
+            pair = crate::models::paid_line(host, provider, region, model)?;
+        }
+        let Some(pair_value) = pair
+            .as_ref()
+            .filter(|pair| valid_pair(pair, model))
+            .filter(|_| reset.is_none_or(|reset| reset > chrono::Utc::now().timestamp_millis()))
+        else {
+            if !deferred_deltas.is_empty() {
+                common::emit_deltas(
+                    host,
+                    &mut StreamResponseAccumulator::default(),
+                    &deferred_deltas,
+                )?;
+            }
+            return result;
+        };
+        if let Some(reset) = reset {
+            // SDK 没有 CAS；请求结束后重新读取，避免用旧快照覆盖认证待登录字段。
+            let mut root = crate::state::read(host)?;
+            let windows = root
+                .entry("workbuddy_paid_windows")
+                .or_insert_with(|| json!({}));
+            let windows = windows
+                .as_object_mut()
+                .filter(|windows| windows.values().all(|reset| reset.as_i64().is_some()))
+                .ok_or_else(|| {
+                    common::plugin_error(
+                        ErrorKind::Invalid,
+                        "stored WorkBuddy paid windows are malformed",
+                    )
+                })?;
+            windows.insert(window_key(provider, region, pair_value), json!(reset));
+            crate::state::write(host, root)?;
+        }
+        paid = true;
+    }
+    unreachable!("at most two line attempts")
+}
+
+fn valid_pair(pair: &Value, model: &str) -> bool {
+    let valid_id = |id: &str| {
+        !id.is_empty()
+            && id.len() <= 200
+            && !id.chars().any(char::is_whitespace)
+            && !id.chars().any(char::is_control)
+    };
+    pair.get("freeId").and_then(Value::as_str) == Some(model)
+        && pair.get("allowPaidSwitch").and_then(Value::as_bool) == Some(true)
+        && valid_id(model)
+        && pair
+            .get("paidId")
+            .and_then(Value::as_str)
+            .is_some_and(|paid| paid != model && valid_id(paid))
+        && pair.get("paidMetadata").is_some_and(Value::is_object)
+}
+
+fn window_key(provider: &ProviderSnapshot, region: Region, pair: &Value) -> String {
+    // 身份字段可能含分隔符，JSON 元组编码避免不同账号或线路发生键碰撞。
+    serde_json::to_string(&(
+        provider.provider_id.as_str(),
+        region.id(),
+        provider.credentials.get("uid"),
+        provider.credentials.get("enterprise_id"),
+        pair.get("freeId"),
+        pair.get("paidId"),
+    ))
+    .expect("JSON identity tuple is serializable")
+}
+
+fn has_active_window(
+    root: &serde_json::Map<String, Value>,
+    provider: &ProviderSnapshot,
+    region: Region,
+    free_id: &str,
+) -> bool {
+    let now = chrono::Utc::now().timestamp_millis();
+    root.get("workbuddy_paid_windows")
+        .and_then(Value::as_object)
+        .is_some_and(|windows| {
+            windows.iter().any(|(key, reset)| {
+                if !reset.as_i64().is_some_and(|reset| reset > now) {
+                    return false;
+                }
+                let Ok(identity) = serde_json::from_str::<[Value; 6]>(key) else {
+                    return false;
+                };
+                identity[0].as_str() == Some(provider.provider_id.as_str())
+                    && identity[1].as_str() == Some(region.id())
+                    && identity[2] == *provider.credentials.get("uid").unwrap_or(&Value::Null)
+                    && identity[3]
+                        == *provider
+                            .credentials
+                            .get("enterprise_id")
+                            .unwrap_or(&Value::Null)
+                    && identity[4].as_str() == Some(free_id)
+            })
+        })
+}
+
+fn reset_at(value: &Value) -> Option<i64> {
+    let reset = value
+        .get("resetAt")
+        .or_else(|| value.pointer("/data/resetAt"))
+        .or_else(|| value.pointer("/error/resetAt"));
+    if let Some(reset) = reset {
+        if let Some(number) = reset
+            .as_i64()
+            .or_else(|| reset.as_str().and_then(|text| text.parse().ok()))
+        {
+            return if number > 100_000_000_000 {
+                Some(number)
+            } else {
+                number.checked_mul(1000)
+            };
+        }
+        if let Some(time) = reset
+            .as_str()
+            .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+        {
+            return Some(time.timestamp_millis());
+        }
+    }
+    let message = value
+        .get("message")
+        .or_else(|| value.pointer("/error/message"))
+        .and_then(Value::as_str)?;
+    // 客户端将错误文案中的无时区日期解释为上海时间；只使用实际日期，不假定窗口时长。
+    for (start, _) in message.char_indices() {
+        let Some(text) = message.get(start..start + 19) else {
+            continue;
+        };
+        if let Ok(time) = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
+            .or_else(|_| chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S"))
+        {
+            return Some(time.and_utc().timestamp_millis() - 8 * 60 * 60 * 1000);
+        }
+    }
+    None
+}
+
+fn explicit_rate_limit(value: &Value) -> bool {
+    frame_error_code(value) == Some(6004)
+        || value
+            .pointer("/error/code")
+            .is_some_and(|code| code.as_i64() == Some(6004) || code.as_str() == Some("6004"))
 }
 
 fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
@@ -318,7 +582,9 @@ fn serialize_deepseek_thinking(body: &mut Value, model_metadata: Option<&ModelMe
     {
         return thinking_type == "enabled" || !effort.is_empty();
     }
-    let thinking = object.entry("thinking".to_owned()).or_insert_with(|| json!({}));
+    let thinking = object
+        .entry("thinking".to_owned())
+        .or_insert_with(|| json!({}));
     if !thinking.is_object() {
         *thinking = json!({});
     }
@@ -395,23 +661,32 @@ fn backfill_reasoning(messages: &mut [Value], thinking_enabled: bool) {
     }
 }
 
-fn decode_response(
+fn decode_attempt(
     host: &GuestHost,
     response: HttpResponse,
+    eligible: bool,
+    rate_limit: &mut Option<Value>,
+    deferred_deltas: &mut Vec<AiStreamDelta>,
 ) -> Result<OperationOutput, PluginError> {
     let status = response.status()?;
     let response_headers = response.headers()?;
     if !(200..300).contains(&status) {
         let body = read_http_body(&response, MAX_ERROR_BODY)?;
+        if eligible
+            && let Ok(value) = serde_json::from_slice::<Value>(&body)
+            && explicit_rate_limit(&value)
+        {
+            *rate_limit = Some(value);
+        }
         let mut error = common::upstream_error(status, &response_headers, &body);
         error.message = format!("WorkBuddy inference HTTP {status}");
         return Err(error);
     }
     if is_event_stream(&response_headers) {
-        decode_stream(host, response)
+        decode_stream_attempt(host, response, eligible, rate_limit, deferred_deltas)
     } else {
         // 网关始终回 SSE；非流式响应仍按共享一元解码兜底。
-        decode_unary(host, response)
+        decode_unary_attempt(host, response, eligible, rate_limit)
     }
 }
 
@@ -436,7 +711,12 @@ fn in_band_error(value: &Value) -> Option<PluginError> {
     Some(common::model_error(AiErrorKind::ServerError, detail))
 }
 
-fn decode_unary(host: &GuestHost, response: HttpResponse) -> Result<OperationOutput, PluginError> {
+fn decode_unary_attempt(
+    host: &GuestHost,
+    response: HttpResponse,
+    eligible: bool,
+    rate_limit: &mut Option<Value>,
+) -> Result<OperationOutput, PluginError> {
     let body = read_http_body(&response, MAX_UNARY_BODY)?;
     let value: Value = serde_json::from_slice(&body).map_err(|error| {
         common::model_error(
@@ -445,6 +725,9 @@ fn decode_unary(host: &GuestHost, response: HttpResponse) -> Result<OperationOut
         )
     })?;
     if let Some(error) = in_band_error(&value) {
+        if eligible && explicit_rate_limit(&value) {
+            *rate_limit = Some(value);
+        }
         return Err(error);
     }
     if !value
@@ -469,15 +752,54 @@ fn decode_unary(host: &GuestHost, response: HttpResponse) -> Result<OperationOut
     Ok(OperationOutput::Infer(Box::new(complete)))
 }
 
-fn decode_stream(host: &GuestHost, response: HttpResponse) -> Result<OperationOutput, PluginError> {
+fn decode_stream_attempt(
+    host: &GuestHost,
+    response: HttpResponse,
+    eligible: bool,
+    rate_limit: &mut Option<Value>,
+    deferred_deltas: &mut Vec<AiStreamDelta>,
+) -> Result<OperationOutput, PluginError> {
     let endpoint = common::endpoint(PROTOCOL)?;
     let mut interpreter = StreamInterpreter::new(endpoint)?;
+    interpreter.normalizer.capture_rate_limit = eligible;
     let mut accumulator = StreamResponseAccumulator::default();
+    let mut emitted = false;
     while let Some(chunk) = response.read_body()? {
         let deltas = interpreter.push(&chunk)?;
+        if eligible
+            && !emitted
+            && !deltas.is_empty()
+            && deltas
+                .iter()
+                .all(|delta| matches!(delta, AiStreamDelta::StreamError { .. }))
+            && let Some(value) = interpreter.normalizer.rate_limit.take()
+        {
+            *rate_limit = Some(value);
+            *deferred_deltas = deltas;
+            return Err(common::model_error(
+                AiErrorKind::ServerError,
+                "WorkBuddy upstream error 6004",
+            ));
+        }
+        emitted |= !deltas.is_empty();
         common::emit_deltas(host, &mut accumulator, &deltas)?;
     }
     let deltas = interpreter.finish()?;
+    if eligible
+        && !emitted
+        && !deltas.is_empty()
+        && deltas
+            .iter()
+            .all(|delta| matches!(delta, AiStreamDelta::StreamError { .. }))
+        && let Some(value) = interpreter.normalizer.rate_limit.take()
+    {
+        *rate_limit = Some(value);
+        *deferred_deltas = deltas;
+        return Err(common::model_error(
+            AiErrorKind::ServerError,
+            "WorkBuddy upstream error 6004",
+        ));
+    }
     common::emit_deltas(host, &mut accumulator, &deltas)?;
     if !interpreter.terminated {
         // 截断或没有终止标记的流绝不能记成空成功：UnexpectedEof 经
@@ -565,6 +887,8 @@ struct SseNormalizer {
     event_open: bool,
     done: bool,
     finished_choice: bool,
+    rate_limit: Option<Value>,
+    capture_rate_limit: bool,
 }
 
 impl SseNormalizer {
@@ -652,6 +976,7 @@ impl SseNormalizer {
         if !contains_subslice(payload, b"function_call")
             && !contains_subslice(payload, b"\"code\"")
             && !contains_subslice(payload, b"\"finish_reason\"")
+            && !contains_subslice(payload, b"\"error\"")
         {
             return Cow::Borrowed(payload);
         }
@@ -661,6 +986,9 @@ impl SseNormalizer {
         let Ok(mut value) = serde_json::from_str::<Value>(text) else {
             return Cow::Borrowed(payload);
         };
+        if self.capture_rate_limit && explicit_rate_limit(&value) && self.rate_limit.is_none() {
+            self.rate_limit = Some(value.clone());
+        }
         self.finished_choice |= value
             .pointer("/choices/0/finish_reason")
             .and_then(Value::as_str)

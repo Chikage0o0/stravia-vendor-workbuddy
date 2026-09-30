@@ -4,7 +4,10 @@
   "channel_cn_description": "使用国内版 WorkBuddy 账号。浏览器授权；模型列表从当前账号的 /v3/config 获取，不检测额度。",
   "channel_intl_description": "使用国际版 WorkBuddy AI 账号。浏览器授权；模型列表从当前账号的 /v3/config 获取。",
   "model_ids": "自定义模型 ID",
-  "model_ids_description": "可选，每行一个模型 ID。填写后仅同步这些明确指定的模型；留空时从账号的 /v3/config 实时发现。不会检测额度或自动调用模型。",
+  "model_ids_description": "可选，每行一个模型 ID。填写后仅同步这些明确指定的模型；留空时按账号 /v3/config 的默认 agent 名单发现并合并免费／付费线路。模型发现不调用模型或检测额度；推理时是否自动使用付费线路由独立开关控制。",
   "invalid_model_ids": "模型 ID 必须是非空单行文本，每项最长 200 字符，不允许控制字符或重复项。",
+  "auto_paid_on_rate_limit": "频控后自动使用付费线路",
+  "auto_paid_on_rate_limit_description": "默认关闭。开启即允许免费线路返回 6004 频控错误后，自动使用上游配置的付费线路并消耗积分。仅在尚未输出响应时切换一次；频控窗口结束后恢复免费线路。",
+  "invalid_auto_paid_on_rate_limit": "自动付费线路选项必须是布尔值。",
   "invalid_options": "存在不支持的 WorkBuddy 配置字段。"
 }

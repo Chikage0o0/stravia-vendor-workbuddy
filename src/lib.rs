@@ -3,6 +3,7 @@ mod auth;
 mod inference;
 mod models;
 mod profile;
+mod state;
 mod messages {
     include!(concat!(env!("OUT_DIR"), "/messages.rs"));
 }

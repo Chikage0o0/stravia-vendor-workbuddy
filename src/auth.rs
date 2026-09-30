@@ -260,9 +260,9 @@ fn refresh(
     })
 }
 
-/// 吊销：无已知的上游吊销端点，仅清除本地待登录状态并向宿主报告 Revoked。
+/// 吊销：无已知的上游吊销端点，清除本地待登录状态与付费窗口并报告 Revoked。
 fn revoke(host: &GuestHost) -> Result<AuthResponse, PluginError> {
-    clear_pending(host)?;
+    host.write_private_state(b"")?;
     Ok(AuthResponse::Revoked)
 }
 
@@ -659,24 +659,33 @@ fn normalize_epoch_ms(value: Option<&Value>) -> Option<i64> {
 }
 
 fn read_pending(host: &GuestHost) -> Result<Option<PendingLogin>, PluginError> {
-    let bytes = host.read_private_state()?;
-    let Some(bytes) = bytes.filter(|bytes| !bytes.is_empty()) else {
+    let root = crate::state::read(host)?;
+    if !root.contains_key("state") {
         return Ok(None);
-    };
-    serde_json::from_slice(&bytes)
+    }
+    serde_json::from_value(Value::Object(root))
         .map(Some)
         .map_err(|_| invalid("stored WorkBuddy login state is malformed"))
 }
 
 fn write_pending(host: &GuestHost, pending: &PendingLogin) -> Result<(), PluginError> {
-    let bytes = serde_json::to_vec(pending)
-        .map_err(|_| invalid("WorkBuddy login state could not be encoded"))?;
-    host.write_private_state(&bytes)
+    let mut root = crate::state::read(host)?;
+    let Value::Object(value) = serde_json::to_value(pending)
+        .map_err(|_| invalid("WorkBuddy login state could not be encoded"))?
+    else {
+        return Err(invalid("WorkBuddy login state could not be encoded"));
+    };
+    root.extend(value);
+    crate::state::write(host, root)
 }
 
-/// 私有状态没有删除原语：写入空字节即视为无待登录会话。
+/// 清除旧 root 格式的认证字段，保留付费窗口与未知扩展。
 fn clear_pending(host: &GuestHost) -> Result<(), PluginError> {
-    host.write_private_state(b"")
+    let mut root = crate::state::read(host)?;
+    for key in ["version", "state", "region", "created_unix_ms"] {
+        root.remove(key);
+    }
+    crate::state::write(host, root)
 }
 
 fn unix_millis() -> i64 {
