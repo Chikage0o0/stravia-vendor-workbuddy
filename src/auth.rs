@@ -111,6 +111,7 @@ fn start(host: &GuestHost, region: Region) -> Result<AuthResponse, PluginError> 
         user_code: None,
         verification_uri: Some(auth_url.to_owned()),
         interval_seconds: Some(POLL_INTERVAL_SECONDS),
+        state: None,
     })
 }
 
