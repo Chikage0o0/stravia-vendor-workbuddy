@@ -173,6 +173,277 @@ fn response_wire(output: OperationOutput) -> Value {
         .unwrap()
 }
 
+fn whitelist_request() -> stravia_vendor_sdk::AiRequest {
+    let endpoint = common::endpoint("openai-compatible").unwrap();
+    let mut request = ProtocolTransform::global()
+        .bind(endpoint, endpoint)
+        .unwrap()
+        .decode_request(json!({
+            "model":"client-route-name", "stream":true,
+            "temperature":0.25,"top_p":0.8,"max_tokens":123,"reasoning_effort":"medium",
+            "store":true,"prompt_cache_retention":"24h",
+            "logit_bias":{"1":1},"logprobs":true,"top_logprobs":2,"n":2,"seed":7,
+            "user":"client-user","metadata":{"client":"only"},"service_tier":"auto",
+            "stream_options":{"include_usage":true,"include_obfuscation":true},
+            "response_format":{"type":"json_schema","json_schema":{
+                "name":"weather_result","schema":{
+                    "type":"object","properties":{"x_client_only":{"type":"string","default":"杭州"}},
+                    "default":{"x_client_only":"杭州"},"x_schema_extension":{"x_structure_only":true}
+                }
+            }},
+            "x_client_only":{"secret":"never-forward"},
+            "thinking":{"type":"enabled","x_structure_only":true},
+            "messages":[
+                {"role":"user","content":"保留 x_client_only 和 x_structure_only 原文","x_structure_only":true},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"call_weather","type":"function","x_structure_only":true,
+                     "function":{"name":"weather","arguments":"{\"x_client_only\":{\"city\":\"杭州\"}}","x_structure_only":true}}
+                ]},
+                {"role":"tool","tool_call_id":"call_weather","content":"{\"x_client_only\":\"tool result\"}","x_structure_only":true}
+            ],
+            "tools":[{"type":"function","x_structure_only":true,"function":{
+                "name":"weather","description":"保留 x_structure_only 描述","x_structure_only":true,
+                "parameters":{
+                    "type":"object",
+                    "properties":{"x_client_only":{"type":"object","default":{"x_structure_only":"杭州"}}},
+                    "default":{"x_client_only":{"x_structure_only":"杭州"}},
+                    "x_schema_extension":{"x_structure_only":true}
+                }
+            }}]
+        }))
+        .unwrap();
+    // 宿主完成路由后会选择 Target Thinking Control；codec 不直接编码 ingress effort。
+    request.reasoning.target_control = Some(
+        stravia_runtime_contract::thinking::TargetThinkingControl::Effort {
+            value: "medium".into(),
+        },
+    );
+    if let Some(raw) = request.meta.raw.as_mut() {
+        raw.headers
+            .insert("X-Client-Only".into(), "never-forward".into());
+        raw.headers
+            .insert("aUtHoRiZaTiOn".into(), "client-auth-must-not-win".into());
+    }
+    request
+}
+
+fn request_with_unknown() -> stravia_vendor_sdk::AiRequest {
+    let endpoint = common::endpoint("openai-compatible").unwrap();
+    let mut wire = ProtocolTransform::global()
+        .bind(endpoint, endpoint)
+        .unwrap()
+        .encode_request(&request())
+        .unwrap()
+        .body;
+    wire["x_client_only"] = json!({"secret":"never-forward"});
+    ProtocolTransform::global()
+        .bind(endpoint, endpoint)
+        .unwrap()
+        .decode_request(wire)
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "build the release wasm32-wasip2 component first"]
+async fn inference_whitelist_preserves_user_payload_contract() {
+    let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/wasm32-wasip2/release/stravia_vendor_workbuddy.wasm");
+    let runtime = VendorRuntime::new().unwrap();
+    let plugin = runtime
+        .load(&std::fs::read(artifact).unwrap())
+        .await
+        .unwrap();
+    for (region, domain) in [("cn", "copilot.tencent.com"), ("intl", "www.workbuddy.ai")] {
+        let origin = format!("https://{domain}");
+        let local = LocalUpstream::new(&[&origin]);
+        let mut provider = snapshot(region, &origin);
+        let access_token = token(domain, "whitelist-account", 1);
+        provider.credentials = BTreeMap::from([
+            ("region".into(), json!(region)),
+            ("domain".into(), json!(domain)),
+            ("uid".into(), json!("whitelist-account")),
+            ("access_token".into(), json!(access_token)),
+        ]);
+        provider.client_headers = vec![
+            ("x-ClIeNt-OnLy".into(), "never-forward".into()),
+            ("aUtHoRiZaTiOn".into(), "client-auth-must-not-win".into()),
+            ("X-Domain".into(), "attacker.invalid".into()),
+            ("X-Model-Id".into(), "attacker-model".into()),
+            ("X-Product-Version".into(), "attacker-version".into()),
+            ("Origin".into(), "https://attacker.invalid".into()),
+            ("Referer".into(), "https://attacker.invalid".into()),
+            ("X-CodeBuddy-Request".into(), "attacker".into()),
+            ("Accept-Language".into(), "attacker".into()),
+        ];
+        let input = whitelist_request();
+        let endpoint = common::endpoint("openai-compatible").unwrap();
+        let original = ProtocolTransform::global()
+            .bind(endpoint, endpoint)
+            .unwrap()
+            .encode_request(&input)
+            .unwrap()
+            .body;
+        local.reply(Reply::stream(&completion_stream(
+            "test-model",
+            "whitelist answer",
+        )));
+        let output = runtime
+            .execute(
+                &plugin,
+                region,
+                OperationInput::Infer {
+                    provider,
+                    request: input,
+                },
+                local.scope(),
+            )
+            .await
+            .unwrap();
+        let wire = response_wire(output);
+        assert_eq!(wire["choices"][0]["message"]["content"], "whitelist answer");
+        let requests = local.requests.lock();
+        assert_eq!(requests.len(), 1);
+        let chat = &requests[0];
+        assert_eq!(chat.url, format!("{origin}/v2/chat/completions"));
+        let body: Value = serde_json::from_slice(&chat.body).unwrap();
+        assert!(body.get("x_client_only").is_none());
+        for key in [
+            "logit_bias",
+            "logprobs",
+            "top_logprobs",
+            "n",
+            "seed",
+            "user",
+            "metadata",
+            "service_tier",
+        ] {
+            assert!(body.get(key).is_none(), "{key} must not be forwarded");
+        }
+        assert_eq!(body["temperature"], json!(0.25));
+        assert_eq!(body["top_p"], json!(0.8));
+        assert_eq!(body["max_tokens"], json!(123));
+        assert_eq!(body["reasoning_effort"], "medium");
+        assert_eq!(body["store"], true);
+        assert_eq!(body["prompt_cache_retention"], "24h");
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        assert!(body["stream_options"].get("include_obfuscation").is_none());
+        assert_eq!(
+            body["response_format"]["json_schema"]["schema"],
+            json!({
+                "type":"object","properties":{"x_client_only":{"type":"string","default":"杭州"}},
+                "default":{"x_client_only":"杭州"},"x_schema_extension":{"x_structure_only":true}
+            })
+        );
+        assert!(body["thinking"].get("x_structure_only").is_none());
+        for message in body["messages"].as_array().unwrap() {
+            assert!(message.get("x_structure_only").is_none());
+            if let Some(calls) = message["tool_calls"].as_array() {
+                for call in calls {
+                    assert!(call.get("x_structure_only").is_none());
+                    assert!(call["function"].get("x_structure_only").is_none());
+                    assert_eq!(
+                        call["function"]["arguments"],
+                        "{\"x_client_only\":{\"city\":\"杭州\"}}"
+                    );
+                }
+            }
+        }
+        let messages = body["messages"].as_array().unwrap();
+        let user = messages
+            .iter()
+            .find(|message| message["role"] == "user")
+            .unwrap();
+        let tool = messages
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .unwrap();
+        let assistant = messages
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .unwrap();
+        assert_eq!(
+            user["content"],
+            "保留 x_client_only 和 x_structure_only 原文"
+        );
+        assert_eq!(tool["content"], "{\"x_client_only\":\"tool result\"}");
+        assert_eq!(
+            assistant["tool_calls"][0]["function"]["arguments"],
+            "{\"x_client_only\":{\"city\":\"杭州\"}}"
+        );
+        assert!(body["tools"][0].get("x_structure_only").is_none());
+        assert!(
+            body["tools"][0]["function"]
+                .get("x_structure_only")
+                .is_none()
+        );
+        assert_eq!(
+            body["tools"][0]["function"]["description"],
+            "保留 x_structure_only 描述"
+        );
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"],
+            original["tools"][0]["function"]["parameters"]
+        );
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"]["properties"]["x_client_only"]["default"],
+            json!({"x_structure_only":"杭州"})
+        );
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"]["default"],
+            json!({"x_client_only":{"x_structure_only":"杭州"}})
+        );
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"]["x_schema_extension"],
+            json!({"x_structure_only":true})
+        );
+        assert!(
+            !chat
+                .headers
+                .iter()
+                .any(|(key, _)| key.eq_ignore_ascii_case("x-client-only"))
+        );
+        assert!(
+            !chat
+                .headers
+                .iter()
+                .any(|(_, value)| value == "client-auth-must-not-win")
+        );
+        assert!(
+            chat.headers
+                .iter()
+                .any(|(key, value)| key.eq_ignore_ascii_case("x-domain") && value == domain)
+        );
+        for forbidden in [
+            "x-model-id",
+            "x-product-version",
+            "origin",
+            "referer",
+            "x-codebuddy-request",
+            "accept-language",
+        ] {
+            assert!(
+                !chat
+                    .headers
+                    .iter()
+                    .any(|(key, _)| key.eq_ignore_ascii_case(forbidden)),
+                "{forbidden} must not be forwarded"
+            );
+        }
+        assert!(
+            chat.headers
+                .iter()
+                .any(|(key, value)| key.eq_ignore_ascii_case("authorization")
+                    && value.contains(&access_token))
+        );
+        assert!(
+            chat.headers
+                .iter()
+                .any(|(key, value)| key.eq_ignore_ascii_case("x-user-id")
+                    && value == "whitelist-account")
+        );
+    }
+}
+
 fn stream() -> String {
     let frames = [
         json!({"id":"chat-test","model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"想"},"finish_reason":null}]}),
@@ -810,12 +1081,6 @@ fn requested_models(local: &LocalUpstream) -> Vec<String> {
         .map(|request| {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
             let model = body["model"].as_str().unwrap();
-            assert!(
-                request
-                    .headers
-                    .iter()
-                    .any(|(key, value)| key.eq_ignore_ascii_case("x-model-id") && value == model)
-            );
             model.to_owned()
         })
         .collect()
@@ -873,7 +1138,7 @@ async fn automatic_paid_line_switch_and_window_contract() {
                 "cn",
                 OperationInput::Infer {
                     provider: provider.clone(),
-                    request: request(),
+                    request: request_with_unknown(),
                 },
                 local.scope(),
             )
@@ -884,6 +1149,13 @@ async fn automatic_paid_line_switch_and_window_contract() {
             "paid answer"
         );
         assert_eq!(requested_models(&local), ["hy3", "hy3-x"]);
+        for attempt in local.requests.lock().iter() {
+            let body: Value = serde_json::from_slice(&attempt.body).unwrap();
+            assert!(
+                body.get("x_client_only").is_none(),
+                "both free and paid attempts must filter unknown fields"
+            );
+        }
         assert_eq!(
             local
                 .events

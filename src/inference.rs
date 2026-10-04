@@ -1,6 +1,7 @@
 //! WorkBuddy `/v2/chat/completions` 推理通道。
 //!
-//! 请求由共享编解码器产出 canonical 请求体后，只做上游线规要求的最小修正；
+//! 请求由共享编解码器产出 canonical 请求体，完成上游线规修正后按官方 CLI
+//! 的字段白名单过滤；请求头只使用插件生成且在白名单中的字段，未知参数静默丢弃。
 //! 上游响应固定是 SSE 流，先经有界增量规范化（重复 `data:` 前缀、
 //! 心跳注释、空 `function_call` 占位、`{"code":N}` 业务错误包），
 //! 再交给共享流解码器逐事件解出 canonical 增量。
@@ -55,7 +56,7 @@ pub(crate) fn execute(
         .and_then(Value::as_bool)
         == Some(true);
     request.stream.enabled = true;
-    let mut first_auth_headers = Some(auth::headers(provider, region)?);
+    let mut first_auth_headers = Some(auth::inference_headers(provider, region)?);
     let mut pair = if enabled {
         provider
             .model_metadata
@@ -135,7 +136,6 @@ pub(crate) fn execute(
             request.model = model.to_owned();
             None
         };
-        let effective_model = request.model.as_str();
         let encoded = common::encode_inference_request(PROTOCOL, &request)?;
         let mut body = encoded.body;
         normalize_request_body(
@@ -146,21 +146,21 @@ pub(crate) fn execute(
                 provider.model_metadata.as_ref()
             },
         );
+        retain_cli_body(&mut body);
         let body = serde_json::to_vec(&body).map_err(|error| {
             common::plugin_error(
                 ErrorKind::Invalid,
                 format!("failed to serialize request body: {error}"),
             )
         })?;
-        let mut headers = common::header_pairs(&encoded.headers)?;
-        headers.extend(match first_auth_headers.take() {
+        // 上游身份与会话头只由插件构造，不接收 codec 或客户端自带的标头。
+        let mut headers = match first_auth_headers.take() {
             Some(headers) => headers,
-            None => auth::headers(provider, region)?,
-        });
-        set_header(&mut headers, "content-type", "application/json");
-        set_header(&mut headers, "accept", "text/event-stream");
-        set_header(&mut headers, "x-model-id", effective_model);
-        apply_session_headers(&mut headers, provider, region);
+            None => auth::inference_headers(provider, region)?,
+        };
+        set_header(&mut headers, "accept", "application/json");
+        apply_session_headers(&mut headers, provider);
+        retain_cli_headers(&mut headers);
         if attempt == 0 {
             host.emit_started()?;
         }
@@ -343,6 +343,42 @@ fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
     headers.push((name.to_owned(), value.to_owned()));
 }
 
+/// 来自官方 CLI 的默认传输头、身份拦截器、会话与 OTel 注入器。
+/// 不允许自定义透传配置扩大集合；认证值仍由插件自己的区域凭据产生。
+fn retain_cli_headers(headers: &mut Vec<(String, String)>) {
+    const ALLOWED: &[&str] = &[
+        "content-type",
+        "accept",
+        "authorization",
+        "user-agent",
+        "x-requested-with",
+        "x-agent-purpose",
+        "x-ide-name",
+        "x-ide-type",
+        "x-ide-version",
+        "x-product",
+        "x-domain",
+        "x-user-id",
+        "x-enterprise-id",
+        "x-tenant-id",
+        "x-request-id",
+        "x-conversation-id",
+        "x-conversation-message-id",
+        "x-conversation-request-id",
+        "baggage",
+        "traceparent",
+        "x-trace-id",
+        "x-b3-traceid",
+        "x-b3-spanid",
+        "x-b3-sampled",
+    ];
+    headers.retain(|(key, _)| {
+        ALLOWED
+            .iter()
+            .any(|allowed| key.eq_ignore_ascii_case(allowed))
+    });
+}
+
 /// 官方客户端为推理请求注入的会话链与 OTel 传播标头。
 ///
 /// `X-Conversation-ID` 是上游网关做前缀缓存亲和的稳定路由键，取宿主按
@@ -352,11 +388,7 @@ fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
 ///
 /// 官方线规中 `X-Request-ID` 与 `X-Conversation-Message-ID` 同为每轮
 /// 生成的 messageId，这里共用一枚；轮次级 ID 由插件生成，语义等价。
-fn apply_session_headers(
-    headers: &mut Vec<(String, String)>,
-    provider: &ProviderSnapshot,
-    region: Region,
-) {
+fn apply_session_headers(headers: &mut Vec<(String, String)>, provider: &ProviderSnapshot) {
     let message_id = uuid::Uuid::new_v4().simple().to_string();
     set_header(headers, "x-request-id", &message_id);
     set_header(headers, "x-conversation-message-id", &message_id);
@@ -392,7 +424,6 @@ fn apply_session_headers(
     set_header(headers, "x-b3-traceid", &trace_id);
     set_header(headers, "x-b3-spanid", &span_id);
     set_header(headers, "x-b3-sampled", "1");
-    set_header(headers, "x-product-version", region.version());
 }
 
 /// 编码后请求体的线规修正，逐项对应上游校验错误码：
@@ -436,6 +467,142 @@ fn normalize_request_body(body: &mut Value, model_metadata: Option<&ModelMetadat
     }
     if is_deepseek {
         backfill_reasoning(messages, thinking_enabled);
+    }
+}
+
+/// 白名单取自官方 `@tencent-ai/codebuddy-code@2.161.2` 的
+/// OpenAIChatCompletionsModel、消息转换器与产品思考参数构造。
+/// 只筛协议结构；JSON Schema、工具 arguments 和文本是用户数据，不递归清洗。
+fn retain_cli_body(body: &mut Value) {
+    retain_fields(
+        body,
+        &[
+            "model",
+            "messages",
+            "tools",
+            "temperature",
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "max_tokens",
+            "tool_choice",
+            "parallel_tool_calls",
+            "stream",
+            "stream_options",
+            "store",
+            "prompt_cache_retention",
+            "response_format",
+            "reasoning_effort",
+            "verbosity",
+            "thinking",
+            "reasoning",
+            "reasoning_summary",
+            "enable_thinking",
+            "chat_template_kwargs",
+        ],
+    );
+    if let Some(options) = body.get_mut("stream_options") {
+        retain_fields(options, &["include_usage"]);
+    }
+    if let Some(thinking) = body.get_mut("thinking") {
+        retain_fields(thinking, &["type", "clear_thinking"]);
+    }
+    if let Some(reasoning) = body.get_mut("reasoning") {
+        retain_fields(reasoning, &["effort", "enabled"]);
+    }
+    if let Some(template) = body.get_mut("chat_template_kwargs") {
+        retain_fields(template, &["enable_thinking", "preserve_thinking"]);
+    }
+    if let Some(format) = body.get_mut("response_format") {
+        retain_fields(format, &["type", "json_schema"]);
+        if let Some(schema) = format.get_mut("json_schema") {
+            retain_fields(schema, &["name", "strict", "schema"]);
+        }
+    }
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools {
+            retain_fields(tool, &["type", "function"]);
+            if let Some(function) = tool.get_mut("function") {
+                retain_fields(function, &["name", "description", "parameters", "strict"]);
+            }
+        }
+    }
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            retain_fields(
+                message,
+                &[
+                    "role",
+                    "content",
+                    "name",
+                    "tool_calls",
+                    "tool_call_id",
+                    "reasoning",
+                    "reasoning_content",
+                    "extra_fields",
+                    "audio",
+                ],
+            );
+            if let Some(extra) = message.get_mut("extra_fields") {
+                retain_fields(extra, &["_meta", "google"]);
+                retain_google_signature(extra);
+            }
+            if let Some(audio) = message.get_mut("audio") {
+                retain_fields(audio, &["id"]);
+            }
+            if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                for call in calls {
+                    retain_fields(call, &["id", "type", "function", "extra_content"]);
+                    if let Some(extra) = call.get_mut("extra_content") {
+                        retain_fields(extra, &["google"]);
+                        retain_google_signature(extra);
+                    }
+                    if let Some(function) = call.get_mut("function") {
+                        retain_fields(function, &["name", "arguments"]);
+                    }
+                }
+            }
+            if let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) {
+                for part in content {
+                    retain_fields(
+                        part,
+                        &[
+                            "type",
+                            "text",
+                            "refusal",
+                            "image_url",
+                            "input_audio",
+                            "file",
+                            "cache_control",
+                        ],
+                    );
+                    if let Some(cache) = part.get_mut("cache_control") {
+                        retain_fields(cache, &["type"]);
+                    }
+                    if let Some(image) = part.get_mut("image_url") {
+                        retain_fields(image, &["url", "detail"]);
+                    }
+                    if let Some(audio) = part.get_mut("input_audio") {
+                        retain_fields(audio, &["data", "format"]);
+                    }
+                    if let Some(file) = part.get_mut("file") {
+                        retain_fields(file, &["file_data", "file_id", "filename"]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn retain_google_signature(value: &mut Value) {
+    if let Some(google) = value.get_mut("google") {
+        retain_fields(google, &["thought_signature"]);
+    }
+}
+
+fn retain_fields(value: &mut Value, allowed: &[&str]) {
+    if let Some(object) = value.as_object_mut() {
+        object.retain(|key, _| allowed.contains(&key.as_str()));
     }
 }
 
@@ -1239,6 +1406,85 @@ mod tests {
         assert!(!interpreter.terminated);
     }
 
+    #[test]
+    fn cli_body_filters_structure_without_changing_user_data_or_signatures() {
+        let schema = json!({"type":"object", "properties":{"x_extra":{"default":{"x_extra":1}}}, "x_schema":true});
+        let mut body = json!({
+            "model":"test-model", "metadata":{"x_extra":true},
+            "thinking":{"type":"enabled", "clear_thinking":false, "x_extra":true},
+            "reasoning":{"effort":"high", "enabled":true, "x_extra":true},
+            "chat_template_kwargs":{"enable_thinking":true, "preserve_thinking":true, "x_extra":true},
+            "messages":[{
+                "role":"assistant", "x_extra":true,
+                "content":[{"type":"text", "text":"x_extra stays in text", "x_extra":true,
+                    "cache_control":{"type":"ephemeral", "x_extra":true}}],
+                "extra_fields":{"_meta":{"x_extra":"user metadata"}, "x_extra":true,
+                    "google":{"thought_signature":"opaque-signed-state", "x_extra":true}},
+                "tool_calls":[{"id":"call_1", "type":"function", "x_extra":true,
+                    "function":{"name":"lookup", "arguments":"{\"x_extra\":true}", "x_extra":true},
+                    "extra_content":{"google":{"thought_signature":"tool-signed-state", "x_extra":true}, "x_extra":true}}]
+            }],
+            "tools":[{"type":"function", "x_extra":true, "function":{
+                "name":"lookup", "parameters":schema, "strict":true, "x_extra":true}}],
+            "response_format":{"type":"json_schema", "x_extra":true,
+                "json_schema":{"name":"answer", "strict":true, "schema":schema, "x_extra":true}}
+        });
+        retain_cli_body(&mut body);
+        assert!(body.get("metadata").is_none());
+        assert_eq!(
+            body["thinking"],
+            json!({"type":"enabled", "clear_thinking":false})
+        );
+        assert_eq!(body["reasoning"], json!({"effort":"high", "enabled":true}));
+        assert_eq!(
+            body["chat_template_kwargs"],
+            json!({"enable_thinking":true, "preserve_thinking":true})
+        );
+        let message = &body["messages"][0];
+        assert!(message.get("x_extra").is_none());
+        assert_eq!(
+            message["content"][0],
+            json!({"type":"text", "text":"x_extra stays in text", "cache_control":{"type":"ephemeral"}})
+        );
+        assert_eq!(
+            message["extra_fields"],
+            json!({"_meta":{"x_extra":"user metadata"}, "google":{"thought_signature":"opaque-signed-state"}})
+        );
+        assert_eq!(
+            message["tool_calls"][0],
+            json!({"id":"call_1", "type":"function",
+            "function":{"name":"lookup", "arguments":"{\"x_extra\":true}"},
+            "extra_content":{"google":{"thought_signature":"tool-signed-state"}}})
+        );
+        assert_eq!(
+            body["tools"][0],
+            json!({"type":"function", "function":{"name":"lookup", "parameters":schema, "strict":true}})
+        );
+        assert_eq!(
+            body["response_format"],
+            json!({"type":"json_schema", "json_schema":{"name":"answer", "strict":true, "schema":schema}})
+        );
+    }
+
+    #[test]
+    fn cli_headers_ignore_unknown_names_case_insensitively() {
+        let mut headers = vec![
+            ("AuThOrIzAtIoN".into(), "Bearer local-test".into()),
+            ("X-Requested-With".into(), "XMLHttpRequest".into()),
+            ("X-Client-Only".into(), "ignored".into()),
+            ("oRiGiN".into(), "https://client.invalid".into()),
+            ("X-Product-Version".into(), "ignored".into()),
+        ];
+        retain_cli_headers(&mut headers);
+        assert_eq!(
+            headers,
+            vec![
+                ("AuThOrIzAtIoN".to_owned(), "Bearer local-test".to_owned()),
+                ("X-Requested-With".to_owned(), "XMLHttpRequest".to_owned()),
+            ]
+        );
+    }
+
     fn metadata(extensions: &[(&str, Value)]) -> ModelMetadata {
         ModelMetadata {
             id: None,
@@ -1390,7 +1636,7 @@ mod tests {
             .operation_metadata
             .insert("session_affinity".into(), Value::String(affinity.clone()));
         let mut headers = Vec::new();
-        apply_session_headers(&mut headers, &provider, Region::Cn);
+        apply_session_headers(&mut headers, &provider);
         assert_eq!(
             header_value(&headers, "x-conversation-id"),
             Some(affinity.as_str())
@@ -1407,20 +1653,19 @@ mod tests {
         // 随机会话键只会打散上游亲和视图。
         let provider = session_provider(&[("session_id", "client-session")]);
         let mut headers = Vec::new();
-        apply_session_headers(&mut headers, &provider, Region::Cn);
+        apply_session_headers(&mut headers, &provider);
         assert!(header_value(&headers, "x-conversation-id").is_none());
         assert!(header_value(&headers, "baggage").is_none());
         // 轮次级与追踪标头仍然齐备。
         assert!(header_value(&headers, "x-conversation-message-id").is_some());
         assert!(header_value(&headers, "x-conversation-request-id").is_some());
-        assert!(header_value(&headers, "x-product-version").is_some());
     }
 
     #[test]
     fn request_id_matches_message_id_like_the_official_client() {
         let provider = session_provider(&[]);
         let mut headers = Vec::new();
-        apply_session_headers(&mut headers, &provider, Region::Cn);
+        apply_session_headers(&mut headers, &provider);
         let message = header_value(&headers, "x-conversation-message-id").unwrap();
         assert_eq!(header_value(&headers, "x-request-id"), Some(message));
     }
@@ -1429,7 +1674,7 @@ mod tests {
     fn trace_headers_form_a_valid_w3c_pair() {
         let provider = session_provider(&[]);
         let mut headers = Vec::new();
-        apply_session_headers(&mut headers, &provider, Region::Cn);
+        apply_session_headers(&mut headers, &provider);
         let traceparent = header_value(&headers, "traceparent").unwrap();
         let trace_id = header_value(&headers, "x-trace-id").unwrap();
         assert_eq!(trace_id.len(), 32);

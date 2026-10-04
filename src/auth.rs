@@ -267,9 +267,35 @@ fn revoke(host: &GuestHost) -> Result<AuthResponse, PluginError> {
     Ok(AuthResponse::Revoked)
 }
 
-/// 供推理与模型发现共用的完整出站标头（桌面端产品身份 + 请求信封）。
-/// 凭据字段先校验再进入标头，控制字符/空白一律拒绝，防止标头注入。
+/// 模型发现保留原有请求信封；聊天请求直接使用 CLI 身份头，避免构造后再丢弃。
 pub(crate) fn headers(
+    provider: &ProviderSnapshot,
+    region: Region,
+) -> Result<Vec<(String, String)>, PluginError> {
+    let mut headers = inference_headers(provider, region)?;
+    headers.extend([
+        (
+            "Accept".to_owned(),
+            "application/json, text/plain, */*".to_owned(),
+        ),
+        ("Origin".to_owned(), region.website().to_owned()),
+        ("Referer".to_owned(), format!("{}/", region.website())),
+        ("X-CodeBuddy-Request".to_owned(), "1".to_owned()),
+        (
+            "Accept-Language".to_owned(),
+            accept_language(region).to_owned(),
+        ),
+        (
+            "X-Request-ID".to_owned(),
+            uuid::Uuid::new_v4().simple().to_string(),
+        ),
+    ]);
+    Ok(headers)
+}
+
+/// CLI 聊天身份头。凭据先校验，控制字符/空白一律拒绝，防止标头注入。
+/// 请求级 ID 由推理入口生成，避免先生成再覆盖。
+pub(crate) fn inference_headers(
     provider: &ProviderSnapshot,
     region: Region,
 ) -> Result<Vec<(String, String)>, PluginError> {
@@ -279,19 +305,8 @@ pub(crate) fn headers(
         .ok_or_else(|| auth_error("WorkBuddy access token is missing"))?;
     let mut headers = vec![
         ("Content-Type".to_owned(), "application/json".to_owned()),
-        (
-            "Accept".to_owned(),
-            "application/json, text/plain, */*".to_owned(),
-        ),
         ("X-Requested-With".to_owned(), "XMLHttpRequest".to_owned()),
-        ("Origin".to_owned(), region.website().to_owned()),
-        ("Referer".to_owned(), format!("{}/", region.website())),
-        ("X-CodeBuddy-Request".to_owned(), "1".to_owned()),
-        (
-            "Accept-Language".to_owned(),
-            accept_language(region).to_owned(),
-        ),
-        // 桌面端产品身份标头。
+        // 保持 WorkBuddy 身份与区域，不接收客户端自报身份。
         ("X-Agent-Purpose".to_owned(), "conversation".to_owned()),
         ("X-IDE-Name".to_owned(), "WorkBuddy".to_owned()),
         ("X-IDE-Type".to_owned(), "WorkBuddy".to_owned()),
@@ -301,11 +316,6 @@ pub(crate) fn headers(
         ("User-Agent".to_owned(), region.user_agent().to_owned()),
         ("X-User-Id".to_owned(), stored.uid),
         ("Authorization".to_owned(), format!("Bearer {access_token}")),
-        // 每个请求一枚随机 UUID（32 位十六进制，无连字符）。
-        (
-            "X-Request-ID".to_owned(),
-            uuid::Uuid::new_v4().simple().to_string(),
-        ),
     ];
     if let Some(enterprise_id) = stored.enterprise_id {
         headers.push(("X-Enterprise-Id".to_owned(), enterprise_id.clone()));
