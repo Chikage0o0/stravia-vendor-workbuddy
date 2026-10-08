@@ -110,6 +110,10 @@ API Key:  由 Stravia 访问控制配置决定
 
 ## 自行构建
 
+当前源码通过相对路径使用支持 `ProviderDescriptor.icon_svg` 的 Stravia checkout。插件目录旁的 `worktrees/StraviaPlatform/merfolk/` 必须是对应的完整主仓库，不能只下载本插件源码。发布工作流按同一布局检出 Stravia；`STRAVIA_PLATFORM_REF` 仓库变量可指定 revision（默认 `main`），发布前须确保该 revision 已包含内嵌图标契约。
+
+`assets/workbuddy.svg` 使用 [WorkBuddy 官方 SVG](https://download.codebuddy.ai/web/workbuddy/f5bce0c03cdc17fa28d25634fb48d2791c297da3/assets/logo.svg) 的原始 mascot 和双眼几何，去掉背景、渐变及模糊，编译进 Wasm 为透明单色图标。显示需要更新后的 Stravia 宿主并重新导入插件，不在运行时下载品牌资源。图标归属和使用限制见 [NOTICE](NOTICE)。
+
 依赖：Rust `1.98.1`（`rust-toolchain.toml` 已锁定）+ `wasm32-wasip2` target；可选安装 [Task](https://taskfile.dev)。
 
 ```bash

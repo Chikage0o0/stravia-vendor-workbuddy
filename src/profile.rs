@@ -54,6 +54,7 @@ pub(crate) fn descriptor() -> VendorDescriptor {
         providers: vec![ProviderDescriptor {
             provider_id: VENDOR_ID.into(),
             catalog_id: None,
+            icon_svg: Some(include_str!("../assets/workbuddy.svg").into()),
             display_name: "WorkBuddy".into(),
             description: Some("Unofficial WorkBuddy integration; account and model availability are controlled by the upstream service.".into()),
             channels,

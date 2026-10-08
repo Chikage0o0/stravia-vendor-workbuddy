@@ -14,8 +14,20 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: source/stravia-vendor-workbuddy
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: source/stravia-vendor-workbuddy
+
+      - name: Checkout Stravia host SDK
+        uses: actions/checkout@v4
+        with:
+          repository: Stravia-AI/StraviaPlatform
+          ref: ${{ vars.STRAVIA_PLATFORM_REF || 'main' }}
+          path: source/worktrees/StraviaPlatform/merfolk
 
       # rust-toolchain.toml 是工具链版本的唯一来源
       - name: Read rust-toolchain.toml
@@ -31,6 +43,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: wasm32-wasip2
+          workspaces: source/stravia-vendor-workbuddy -> target
 
       - name: Check tag matches Cargo.toml version
         run: |
@@ -54,4 +67,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: dist/*
+          files: source/stravia-vendor-workbuddy/dist/*
