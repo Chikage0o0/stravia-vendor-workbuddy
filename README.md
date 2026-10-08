@@ -110,7 +110,7 @@ API Key:  由 Stravia 访问控制配置决定
 
 ## 自行构建
 
-当前源码通过相对路径使用支持 `ProviderDescriptor.icon_svg` 的 Stravia checkout。插件目录旁的 `worktrees/StraviaPlatform/merfolk/` 必须是对应的完整主仓库，不能只下载本插件源码。发布工作流按同一布局检出 Stravia；`STRAVIA_PLATFORM_REF` 仓库变量可指定 revision（默认 `main`），发布前须确保该 revision 已包含内嵌图标契约。
+当前源码通过相对路径使用支持 `ProviderDescriptor.icon_svg` 的 Stravia checkout。插件目录旁的 `worktrees/StraviaPlatform/merfolk/` 必须是对应的完整主仓库，不能只下载本插件源码。发布工作流按同一布局检出 Stravia；`STRAVIA_PLATFORM_REF` 仓库变量可指定 revision，默认固定为已验证的 `dbf1db1718fc4f45fca2aed0a03190505cae1892`。覆盖该变量时，发布前须确保所选 revision 已包含内嵌图标契约，并通过构建及组件验证。
 
 `assets/workbuddy.svg` 使用 [WorkBuddy 官方 SVG](https://download.codebuddy.ai/web/workbuddy/f5bce0c03cdc17fa28d25634fb48d2791c297da3/assets/logo.svg) 的原始 mascot 和双眼几何，去掉背景、渐变及模糊，编译进 Wasm 为透明单色图标。显示需要更新后的 Stravia 宿主并重新导入插件，不在运行时下载品牌资源。图标归属和使用限制见 [NOTICE](NOTICE)。
 
@@ -128,13 +128,19 @@ task dist
 task test
 ```
 
+## v0.2.0 升级说明
+
+- **不兼容变更**：推理请求体和请求头仅保留官方 CLI 白名单内的字段。白名单外的参数和自定义请求头不再透传；依赖这些字段的调用方须调整配置。提示词、工具参数和 JSON Schema 等用户数据保持原文。
+- WorkBuddy SVG 图标已嵌入插件。显示图标需要支持 `ProviderDescriptor.icon_svg` 的新版 Stravia 宿主，并重新导入插件。
+- 更新 Stravia SDK 和认证响应契约；源码构建需要上文指定的完整 Stravia checkout。
+
 ## 发布流程（维护者）
 
-版本号以 `Cargo.toml` 的 `version` 为准。打 tag 即触发 GitHub Action 构建并发布 Release：
+版本号以 `Cargo.toml` 的 `version` 为准。同步更新 `Cargo.lock` 中本插件的版本，运行 `task verify`，提交版本变更并推送后，打 tag 触发 GitHub Action 构建并发布 Release：
 
 ```bash
-git tag v0.1.2
-git push origin v0.1.2
+git tag -a v0.2.0 -m "发布 v0.2.0"
+git push origin v0.2.0
 ```
 
 tag 的 `v` 前缀版本号必须与 `Cargo.toml` 一致，否则 workflow 拒绝发布。Release 附件包含 `stravia-vendor-workbuddy-v<版本>.wasm`、`SHA256SUMS`、`LICENSE`、`NOTICE` 及第三方组件许可证。
