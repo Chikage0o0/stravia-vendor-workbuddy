@@ -136,7 +136,9 @@ pub(crate) fn execute(
             request.model = model.to_owned();
             None
         };
-        let encoded = common::encode_inference_request(PROTOCOL, &request)?;
+        // Owned 编码消费请求；只为可能发生的免费→付费切换保留 canonical 请求。
+        let retry_request = (enabled && !paid && attempt == 0).then(|| request.clone());
+        let encoded = common::encode_inference_request(PROTOCOL, request)?;
         let mut body = encoded.body;
         normalize_request_body(
             &mut body,
@@ -225,6 +227,7 @@ pub(crate) fn execute(
             windows.insert(window_key(provider, region, pair_value), json!(reset));
             crate::state::write(host, root)?;
         }
+        request = retry_request.expect("only the first free attempt may switch to a paid line");
         paid = true;
     }
     unreachable!("at most two line attempts")

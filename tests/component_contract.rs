@@ -12,8 +12,8 @@ use stravia_protocol_codec::transform::ProtocolTransform;
 use stravia_runtime_contract::{CancellationToken, Deadline};
 use stravia_vendor_common::common;
 use stravia_vendor_runtime::{
-    HostFailure, HostHttpResponse, HostServices, HostWebSocket, HttpRequest, LogLevel,
-    OperationScope, RuntimeEvent, VendorRuntime,
+    HostFailure, HostHttpResponse, HostServices, HostWebSocket, HttpRequest, LoadedPlugin,
+    LogLevel, OperationScope, RuntimeError, RuntimeEvent, VendorRuntime,
 };
 use stravia_vendor_sdk::{
     AllowanceRequest, AuthRequest, AuthResponse, AuthStep, DiscoverRequest, ErrorKind,
@@ -109,6 +109,7 @@ impl HostServices for LocalUpstream {
         _: Vec<(String, String)>,
         _: Vec<String>,
         _: Option<String>,
+        _: Option<u64>,
     ) -> Result<Arc<dyn HostWebSocket>, HostFailure> {
         Err(HostFailure::new(
             ErrorKind::Unsupported,
@@ -130,6 +131,22 @@ impl HostServices for LocalUpstream {
     fn generation_is_current(&self, generation: u64) -> bool {
         generation == 1
     }
+}
+
+async fn run(
+    runtime: &VendorRuntime,
+    plugin: &LoadedPlugin,
+    channel: &str,
+    input: OperationInput,
+    scope: OperationScope,
+) -> Result<OperationOutput, RuntimeError> {
+    let (operation, encoded) = input
+        .encode_for_host()
+        .map_err(|_| RuntimeError::InvalidOutput)?;
+    drop(input);
+    runtime
+        .execute(plugin, channel, operation, encoded, scope)
+        .await
 }
 
 fn snapshot(region: &str, origin: &str) -> ProviderSnapshot {
@@ -232,7 +249,7 @@ fn request_with_unknown() -> stravia_vendor_sdk::AiRequest {
     let mut wire = ProtocolTransform::global()
         .bind(endpoint, endpoint)
         .unwrap()
-        .encode_request(&request())
+        .encode_request(request())
         .unwrap()
         .body;
     wire["x_client_only"] = json!({"secret":"never-forward"});
@@ -280,25 +297,25 @@ async fn inference_whitelist_preserves_user_payload_contract() {
         let original = ProtocolTransform::global()
             .bind(endpoint, endpoint)
             .unwrap()
-            .encode_request(&input)
+            .encode_request(input.clone())
             .unwrap()
             .body;
         local.reply(Reply::stream(&completion_stream(
             "test-model",
             "whitelist answer",
         )));
-        let output = runtime
-            .execute(
-                &plugin,
-                region,
-                OperationInput::Infer {
-                    provider,
-                    request: input,
-                },
-                local.scope(),
-            )
-            .await
-            .unwrap();
+        let output = run(
+            &runtime,
+            &plugin,
+            region,
+            OperationInput::Infer {
+                provider,
+                request: input,
+            },
+            local.scope(),
+        )
+        .await
+        .unwrap();
         let wire = response_wire(output);
         assert_eq!(wire["choices"][0]["message"]["content"], "whitelist answer");
         let requests = local.requests.lock();
@@ -413,6 +430,24 @@ async fn inference_whitelist_preserves_user_payload_contract() {
                 .iter()
                 .any(|(key, value)| key.eq_ignore_ascii_case("x-domain") && value == domain)
         );
+        let ide_version = &chat
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("x-ide-version"))
+            .expect("product version header")
+            .1;
+        let user_agent = &chat
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("user-agent"))
+            .expect("product user agent")
+            .1;
+        assert!(!ide_version.is_empty());
+        assert!(user_agent.starts_with(&format!("WorkBuddy/{ide_version} ")));
+        let (_, embedded_identity) = user_agent.split_once(' ').unwrap();
+        let (embedded_product, cli_identity) = embedded_identity.rsplit_once(" CLI/").unwrap();
+        assert!(embedded_product.ends_with(&format!("/{ide_version}")));
+        assert!(!cli_identity.is_empty());
         for forbidden in [
             "x-model-id",
             "x-product-version",
@@ -477,82 +512,82 @@ async fn regional_auth_streaming_and_failure_contract() {
         let local = LocalUpstream::new(&[&origin]);
         let mut provider = snapshot(region, &origin);
         local.reply(Reply::json(json!({"code":0,"data":{"state":"local-state","authUrl":format!("{origin}/login?state=local-state")}})));
-        let start = runtime
-            .execute(
-                &plugin,
-                region,
-                OperationInput::Auth {
-                    provider: provider.clone(),
-                    request: AuthRequest {
-                        step: AuthStep::Start {
-                            redirect_uri: String::new(),
-                            state: "host-state".into(),
-                        },
+        let start = run(
+            &runtime,
+            &plugin,
+            region,
+            OperationInput::Auth {
+                provider: provider.clone(),
+                request: AuthRequest {
+                    step: AuthStep::Start {
+                        redirect_uri: String::new(),
+                        state: "host-state".into(),
                     },
                 },
-                local.scope(),
-            )
-            .await
-            .unwrap();
+            },
+            local.scope(),
+        )
+        .await
+        .unwrap();
         let OperationOutput::Auth(AuthResponse::Authorization { url, .. }) = start else {
             panic!("expected browser authorization")
         };
         assert_eq!(url, format!("{origin}/login?state=local-state"));
 
         local.reply(Reply::json(json!({"code":11217})));
-        let pending = runtime
-            .execute(
-                &plugin,
-                region,
-                OperationInput::Auth {
-                    provider: provider.clone(),
-                    request: AuthRequest {
-                        step: AuthStep::Poll,
-                    },
+        let pending = run(
+            &runtime,
+            &plugin,
+            region,
+            OperationInput::Auth {
+                provider: provider.clone(),
+                request: AuthRequest {
+                    step: AuthStep::Poll,
                 },
-                local.scope(),
-            )
-            .await
-            .unwrap();
+            },
+            local.scope(),
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             pending,
             OperationOutput::Auth(AuthResponse::Pending { .. })
         ));
         local.reply(Reply::json(json!({"code":0,"data":{"accessToken":token(domain,"account-a",1),"refreshToken":"refresh-one","domain":domain,"expiresAt":4102444800_i64}})));
-        let login = runtime
-            .execute(
-                &plugin,
-                region,
-                OperationInput::Auth {
-                    provider: provider.clone(),
-                    request: AuthRequest {
-                        step: AuthStep::Poll,
-                    },
+        let login = run(
+            &runtime,
+            &plugin,
+            region,
+            OperationInput::Auth {
+                provider: provider.clone(),
+                request: AuthRequest {
+                    step: AuthStep::Poll,
                 },
-                local.scope(),
-            )
-            .await
-            .unwrap();
+            },
+            local.scope(),
+        )
+        .await
+        .unwrap();
         let OperationOutput::Auth(AuthResponse::Credentials { values, .. }) = login else {
             panic!("expected stored credentials")
         };
         provider.credentials = values;
 
         local.reply(Reply::json(json!({"code":0,"data":{"data":{"accessToken":token(domain,"account-a",2),"refreshToken":"refresh-two","domain":domain}}})));
-        let refresh = runtime
-            .execute(
-                &plugin,
-                region,
-                OperationInput::Auth {
-                    provider: provider.clone(),
-                    request: AuthRequest {
-                        step: AuthStep::Refresh,
-                    },
+        let refresh = run(
+            &runtime,
+            &plugin,
+            region,
+            OperationInput::Auth {
+                provider: provider.clone(),
+                request: AuthRequest {
+                    step: AuthStep::Refresh,
                 },
-                local.scope(),
-            )
-            .await
-            .unwrap();
+            },
+            local.scope(),
+        )
+        .await
+        .unwrap();
         let OperationOutput::Auth(AuthResponse::Credentials { values, .. }) = refresh else {
             panic!("expected refreshed credentials")
         };
@@ -560,18 +595,18 @@ async fn regional_auth_streaming_and_failure_contract() {
         assert_eq!(provider.credentials["refresh_token"], "refresh-two");
 
         local.reply(Reply::json(json!({"code":0,"data":{"models":[{"id":"test-model","name":"Test","supportsToolCall":true,"credits":"x0.10"}],"agents":[{"name":"cli","tags":["default"],"models":["test-model"]}]}})));
-        let discovered = runtime
-            .execute(
-                &plugin,
-                region,
-                OperationInput::Discover {
-                    provider: provider.clone(),
-                    request: DiscoverRequest::default(),
-                },
-                local.scope(),
-            )
-            .await
-            .unwrap();
+        let discovered = run(
+            &runtime,
+            &plugin,
+            region,
+            OperationInput::Discover {
+                provider: provider.clone(),
+                request: DiscoverRequest::default(),
+            },
+            local.scope(),
+        )
+        .await
+        .unwrap();
         let OperationOutput::Discover(discovered) = discovered else {
             panic!("expected discovered models")
         };
@@ -583,18 +618,18 @@ async fn regional_auth_streaming_and_failure_contract() {
         );
 
         local.reply(Reply::stream(&stream()));
-        let output = runtime
-            .execute(
-                &plugin,
-                region,
-                OperationInput::Infer {
-                    provider: provider.clone(),
-                    request: request(),
-                },
-                local.scope(),
-            )
-            .await
-            .unwrap();
+        let output = run(
+            &runtime,
+            &plugin,
+            region,
+            OperationInput::Infer {
+                provider: provider.clone(),
+                request: request(),
+            },
+            local.scope(),
+        )
+        .await
+        .unwrap();
         let wire = response_wire(output);
         assert_eq!(wire["choices"][0]["message"]["content"], "你好");
         assert_eq!(wire["choices"][0]["message"]["reasoning_content"], "想");
@@ -649,17 +684,17 @@ async fn regional_auth_streaming_and_failure_contract() {
             "region".into(),
             json!(if region == "cn" { "intl" } else { "cn" }),
         );
-        let rejected = runtime
-            .execute(
-                &plugin,
-                region,
-                OperationInput::Infer {
-                    provider: crossed,
-                    request: request(),
-                },
-                local.scope(),
-            )
-            .await;
+        let rejected = run(
+            &runtime,
+            &plugin,
+            region,
+            OperationInput::Infer {
+                provider: crossed,
+                request: request(),
+            },
+            local.scope(),
+        )
+        .await;
         assert!(rejected.is_err());
         assert_eq!(
             local.requests.lock().len(),
@@ -674,33 +709,33 @@ async fn regional_auth_streaming_and_failure_contract() {
                 br#"{"error":{"message":"rate limited"}}"#.to_vec()
             ])),
         });
-        let limited = runtime
-            .execute(
-                &plugin,
-                region,
-                OperationInput::Infer {
-                    provider: provider.clone(),
-                    request: request(),
-                },
-                local.scope(),
-            )
-            .await
-            .unwrap_err();
+        let limited = run(
+            &runtime,
+            &plugin,
+            region,
+            OperationInput::Infer {
+                provider: provider.clone(),
+                request: request(),
+            },
+            local.scope(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(limited.upstream_status(), Some(429));
         assert_eq!(limited.retry_after(), Some(Duration::from_secs(17)));
 
         local.reply(Reply::stream("data: {\"id\":\"cut\",\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n"));
-        let truncated = runtime
-            .execute(
-                &plugin,
-                region,
-                OperationInput::Infer {
-                    provider: provider.clone(),
-                    request: request(),
-                },
-                local.scope(),
-            )
-            .await;
+        let truncated = run(
+            &runtime,
+            &plugin,
+            region,
+            OperationInput::Infer {
+                provider: provider.clone(),
+                request: request(),
+            },
+            local.scope(),
+        )
+        .await;
         assert!(
             truncated.is_err(),
             "EOF without a terminal must not become success"
@@ -771,8 +806,7 @@ async fn regional_allowance_contract() {
                 "CapacitySize":4481, "CapacityRemain":4481
             }),
         ])));
-        let output = runtime
-            .execute(&plugin, region, input(), local.scope())
+        let output = run(&runtime, &plugin, region, input(), local.scope())
             .await
             .unwrap();
         let OperationOutput::Allowance(result) = output else {
@@ -833,8 +867,7 @@ async fn regional_allowance_contract() {
         local.reply(Reply::json(resource_response(vec![
             json!({"PackageName":"Last","CapacityRemain":7,"CapacitySize":10}),
         ])));
-        let output = runtime
-            .execute(&plugin, region, input(), local.scope())
+        let output = run(&runtime, &plugin, region, input(), local.scope())
             .await
             .unwrap();
         let OperationOutput::Allowance(result) = output else {
@@ -860,16 +893,14 @@ async fn regional_allowance_contract() {
         )));
         local.reply(Reply::json(json!({"code":123})));
         assert!(
-            runtime
-                .execute(&plugin, region, input(), local.scope())
+            run(&runtime, &plugin, region, input(), local.scope())
                 .await
                 .is_err(),
             "a later-page failure must not publish the first page as the account balance"
         );
 
         local.reply(Reply::json(resource_response(Vec::new())));
-        let output = runtime
-            .execute(&plugin, region, input(), local.scope())
+        let output = run(&runtime, &plugin, region, input(), local.scope())
             .await
             .unwrap();
         let OperationOutput::Allowance(result) = output else {
@@ -879,8 +910,7 @@ async fn regional_allowance_contract() {
         assert_eq!(result.allowances[0].used.as_ref().unwrap().value, "0");
 
         local.reply(Reply::json(json!({"code":123,"msg":"do-not-echo"})));
-        let error = runtime
-            .execute(&plugin, region, input(), local.scope())
+        let error = run(&runtime, &plugin, region, input(), local.scope())
             .await
             .unwrap_err();
         assert!(
@@ -891,8 +921,7 @@ async fn regional_allowance_contract() {
         );
         local.reply(Reply::json(json!({})));
         assert!(
-            runtime
-                .execute(&plugin, region, input(), local.scope())
+            run(&runtime, &plugin, region, input(), local.scope())
                 .await
                 .is_err()
         );
@@ -902,8 +931,7 @@ async fn regional_allowance_contract() {
             headers: vec![("retry-after".into(), "17".into())],
             chunks: Mutex::new(VecDeque::from([b"{}".to_vec()])),
         });
-        let limited = runtime
-            .execute(&plugin, region, input(), local.scope())
+        let limited = run(&runtime, &plugin, region, input(), local.scope())
             .await
             .unwrap_err();
         assert_eq!(limited.upstream_status(), Some(429));
@@ -915,18 +943,18 @@ async fn regional_allowance_contract() {
             json!(if region == "cn" { "intl" } else { "cn" }),
         );
         assert!(
-            runtime
-                .execute(
-                    &plugin,
-                    region,
-                    OperationInput::Allowance {
-                        provider: wrong,
-                        request: AllowanceRequest::default()
-                    },
-                    local.scope()
-                )
-                .await
-                .is_err()
+            run(
+                &runtime,
+                &plugin,
+                region,
+                OperationInput::Allowance {
+                    provider: wrong,
+                    request: AllowanceRequest::default()
+                },
+                local.scope()
+            )
+            .await
+            .is_err()
         );
         assert_eq!(local.requests.lock().len(), before);
         assert!(
@@ -980,18 +1008,18 @@ async fn default_agent_models_merge_free_and_paid_lines() {
             {"freeId":"hy4-preview-f","paidId":"hy4-preview","displayName":"Hy4 preview","allowPaidSwitch":true}
         ]}}
     }})));
-    let output = runtime
-        .execute(
-            &plugin,
-            "cn",
-            OperationInput::Discover {
-                provider: provider.clone(),
-                request: DiscoverRequest::default(),
-            },
-            local.scope(),
-        )
-        .await
-        .unwrap();
+    let output = run(
+        &runtime,
+        &plugin,
+        "cn",
+        OperationInput::Discover {
+            provider: provider.clone(),
+            request: DiscoverRequest::default(),
+        },
+        local.scope(),
+    )
+    .await
+    .unwrap();
     let OperationOutput::Discover(discovered) = output else {
         panic!("expected discovery");
     };
@@ -1015,17 +1043,17 @@ async fn default_agent_models_merge_free_and_paid_lines() {
         local.reply(Reply::json(json!({"code":0,"data":{
             "models":[{"id":"old-model","name":"Old model","credits":"x1"}], "agents":agents
         }})));
-        let result = runtime
-            .execute(
-                &plugin,
-                "cn",
-                OperationInput::Discover {
-                    provider: provider.clone(),
-                    request: DiscoverRequest::default(),
-                },
-                local.scope(),
-            )
-            .await;
+        let result = run(
+            &runtime,
+            &plugin,
+            "cn",
+            OperationInput::Discover {
+                provider: provider.clone(),
+                request: DiscoverRequest::default(),
+            },
+            local.scope(),
+        )
+        .await;
         assert!(
             result.is_err(),
             "a missing or empty default roster must not expose a different agent or the full catalog"
@@ -1132,18 +1160,18 @@ async fn automatic_paid_line_switch_and_window_contract() {
             _ => local.reply(Reply::json(cap)),
         }
         local.reply(Reply::stream(&completion_stream("hy3-x", "paid answer")));
-        let output = runtime
-            .execute(
-                &plugin,
-                "cn",
-                OperationInput::Infer {
-                    provider: provider.clone(),
-                    request: request_with_unknown(),
-                },
-                local.scope(),
-            )
-            .await
-            .unwrap();
+        let output = run(
+            &runtime,
+            &plugin,
+            "cn",
+            OperationInput::Infer {
+                provider: provider.clone(),
+                request: request_with_unknown(),
+            },
+            local.scope(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             response_wire(output)["choices"][0]["message"]["content"],
             "paid answer"
@@ -1180,18 +1208,18 @@ async fn automatic_paid_line_switch_and_window_contract() {
             "hy3"
         };
         local.reply(Reply::stream(&completion_stream(next_model, "next answer")));
-        let output = runtime
-            .execute(
-                &plugin,
-                "cn",
-                OperationInput::Infer {
-                    provider: provider.clone(),
-                    request: request(),
-                },
-                local.scope(),
-            )
-            .await
-            .unwrap();
+        let output = run(
+            &runtime,
+            &plugin,
+            "cn",
+            OperationInput::Infer {
+                provider: provider.clone(),
+                request: request(),
+            },
+            local.scope(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             response_wire(output)["choices"][0]["message"]["content"],
             "next answer"
@@ -1206,18 +1234,18 @@ async fn automatic_paid_line_switch_and_window_contract() {
                 "hy3",
                 "free after opt-out",
             )));
-            let output = runtime
-                .execute(
-                    &plugin,
-                    "cn",
-                    OperationInput::Infer {
-                        provider: provider.clone(),
-                        request: request(),
-                    },
-                    local.scope(),
-                )
-                .await
-                .unwrap();
+            let output = run(
+                &runtime,
+                &plugin,
+                "cn",
+                OperationInput::Infer {
+                    provider: provider.clone(),
+                    request: request(),
+                },
+                local.scope(),
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 response_wire(output)["choices"][0]["message"]["content"],
                 "free after opt-out"
@@ -1239,18 +1267,18 @@ async fn automatic_paid_line_switch_and_window_contract() {
                 "hy3",
                 "other account free",
             )));
-            let output = runtime
-                .execute(
-                    &plugin,
-                    "cn",
-                    OperationInput::Infer {
-                        provider: other_account,
-                        request: request(),
-                    },
-                    local.scope(),
-                )
-                .await
-                .unwrap();
+            let output = run(
+                &runtime,
+                &plugin,
+                "cn",
+                OperationInput::Infer {
+                    provider: other_account,
+                    request: request(),
+                },
+                local.scope(),
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 response_wire(output)["choices"][0]["message"]["content"],
                 "other account free"
@@ -1265,18 +1293,18 @@ async fn automatic_paid_line_switch_and_window_contract() {
                 "hy3",
                 "other tenant free",
             )));
-            let output = runtime
-                .execute(
-                    &plugin,
-                    "cn",
-                    OperationInput::Infer {
-                        provider: other_tenant,
-                        request: request(),
-                    },
-                    local.scope(),
-                )
-                .await
-                .unwrap();
+            let output = run(
+                &runtime,
+                &plugin,
+                "cn",
+                OperationInput::Infer {
+                    provider: other_tenant,
+                    request: request(),
+                },
+                local.scope(),
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 response_wire(output)["choices"][0]["message"]["content"],
                 "other tenant free"
@@ -1300,18 +1328,18 @@ async fn automatic_paid_line_switch_and_window_contract() {
                 "hy3",
                 "other region free",
             )));
-            let output = runtime
-                .execute(
-                    &plugin,
-                    "intl",
-                    OperationInput::Infer {
-                        provider: other_region,
-                        request: request(),
-                    },
-                    local.scope(),
-                )
-                .await
-                .unwrap();
+            let output = run(
+                &runtime,
+                &plugin,
+                "intl",
+                OperationInput::Infer {
+                    provider: other_region,
+                    request: request(),
+                },
+                local.scope(),
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 response_wire(output)["choices"][0]["message"]["content"],
                 "other region free"
@@ -1335,18 +1363,18 @@ async fn automatic_paid_line_switch_and_window_contract() {
                 "hy3",
                 "free after window expiry",
             )));
-            let output = runtime
-                .execute(
-                    &plugin,
-                    "cn",
-                    OperationInput::Infer {
-                        provider,
-                        request: request(),
-                    },
-                    local.scope(),
-                )
-                .await
-                .unwrap();
+            let output = run(
+                &runtime,
+                &plugin,
+                "cn",
+                OperationInput::Infer {
+                    provider,
+                    request: request(),
+                },
+                local.scope(),
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 response_wire(output)["choices"][0]["message"]["content"],
                 "free after window expiry"
@@ -1415,17 +1443,17 @@ async fn automatic_paid_line_rejects_unsafe_retries() {
         if scenario == "paid-fails" {
             local.reply(Reply::json(json!({"code":6004})));
         }
-        let result = runtime
-            .execute(
-                &plugin,
-                "cn",
-                OperationInput::Infer {
-                    provider,
-                    request: request(),
-                },
-                local.scope(),
-            )
-            .await;
+        let result = run(
+            &runtime,
+            &plugin,
+            "cn",
+            OperationInput::Infer {
+                provider,
+                request: request(),
+            },
+            local.scope(),
+        )
+        .await;
         assert!(
             result.is_err(),
             "{scenario} must not turn an upstream failure into success"
@@ -1484,18 +1512,18 @@ async fn configured_model_resolves_paid_line_after_cap() {
         "hy3-x",
         "paid custom model",
     )));
-    let output = runtime
-        .execute(
-            &plugin,
-            "cn",
-            OperationInput::Infer {
-                provider: provider.clone(),
-                request: request(),
-            },
-            local.scope(),
-        )
-        .await
-        .unwrap();
+    let output = run(
+        &runtime,
+        &plugin,
+        "cn",
+        OperationInput::Infer {
+            provider: provider.clone(),
+            request: request(),
+        },
+        local.scope(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         response_wire(output)["choices"][0]["message"]["content"],
         "paid custom model"
@@ -1506,18 +1534,18 @@ async fn configured_model_resolves_paid_line_after_cap() {
         "hy3-x",
         "custom model inside window",
     )));
-    let output = runtime
-        .execute(
-            &plugin,
-            "cn",
-            OperationInput::Infer {
-                provider,
-                request: request(),
-            },
-            local.scope(),
-        )
-        .await
-        .unwrap();
+    let output = run(
+        &runtime,
+        &plugin,
+        "cn",
+        OperationInput::Infer {
+            provider,
+            request: request(),
+        },
+        local.scope(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         response_wire(output)["choices"][0]["message"]["content"],
         "custom model inside window"
@@ -1551,60 +1579,60 @@ async fn paid_window_survives_login_and_revoke_clears_it() {
         "hy3-x",
         "paid before login",
     )));
-    let output = runtime
-        .execute(
-            &plugin,
-            "cn",
-            OperationInput::Infer {
-                provider: provider.clone(),
-                request: request(),
-            },
-            local.scope(),
-        )
-        .await
-        .unwrap();
+    let output = run(
+        &runtime,
+        &plugin,
+        "cn",
+        OperationInput::Infer {
+            provider: provider.clone(),
+            request: request(),
+        },
+        local.scope(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         response_wire(output)["choices"][0]["message"]["content"],
         "paid before login"
     );
 
     local.reply(Reply::json(json!({"code":0,"data":{"state":"another-login","authUrl":"https://copilot.tencent.com/login?state=another-login"}})));
-    let started = runtime
-        .execute(
-            &plugin,
-            "cn",
-            OperationInput::Auth {
-                provider: provider.clone(),
-                request: AuthRequest {
-                    step: AuthStep::Start {
-                        redirect_uri: String::new(),
-                        state: "host-state".into(),
-                    },
+    let started = run(
+        &runtime,
+        &plugin,
+        "cn",
+        OperationInput::Auth {
+            provider: provider.clone(),
+            request: AuthRequest {
+                step: AuthStep::Start {
+                    redirect_uri: String::new(),
+                    state: "host-state".into(),
                 },
             },
-            local.scope(),
-        )
-        .await
-        .unwrap();
+        },
+        local.scope(),
+    )
+    .await
+    .unwrap();
     assert!(matches!(
         started,
         OperationOutput::Auth(AuthResponse::Authorization { .. })
     ));
     local.reply(Reply::json(json!({"code":11217})));
-    let pending = runtime
-        .execute(
-            &plugin,
-            "cn",
-            OperationInput::Auth {
-                provider: provider.clone(),
-                request: AuthRequest {
-                    step: AuthStep::Poll,
-                },
+    let pending = run(
+        &runtime,
+        &plugin,
+        "cn",
+        OperationInput::Auth {
+            provider: provider.clone(),
+            request: AuthRequest {
+                step: AuthStep::Poll,
             },
-            local.scope(),
-        )
-        .await
-        .unwrap();
+        },
+        local.scope(),
+    )
+    .await
+    .unwrap();
     assert!(matches!(
         pending,
         OperationOutput::Auth(AuthResponse::Pending { .. })
@@ -1614,18 +1642,18 @@ async fn paid_window_survives_login_and_revoke_clears_it() {
         "hy3-x",
         "paid during pending login",
     )));
-    let output = runtime
-        .execute(
-            &plugin,
-            "cn",
-            OperationInput::Infer {
-                provider: provider.clone(),
-                request: request(),
-            },
-            local.scope(),
-        )
-        .await
-        .unwrap();
+    let output = run(
+        &runtime,
+        &plugin,
+        "cn",
+        OperationInput::Infer {
+            provider: provider.clone(),
+            request: request(),
+        },
+        local.scope(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         response_wire(output)["choices"][0]["message"]["content"],
         "paid during pending login"
@@ -1633,20 +1661,20 @@ async fn paid_window_survives_login_and_revoke_clears_it() {
     assert_eq!(requested_models(&local).last().unwrap(), "hy3-x");
 
     local.reply(Reply::json(json!({"code":0,"data":{"accessToken":token("copilot.tencent.com","account-a",2),"refreshToken":"new-refresh","domain":"copilot.tencent.com"}})));
-    let authenticated = runtime
-        .execute(
-            &plugin,
-            "cn",
-            OperationInput::Auth {
-                provider: provider.clone(),
-                request: AuthRequest {
-                    step: AuthStep::Poll,
-                },
+    let authenticated = run(
+        &runtime,
+        &plugin,
+        "cn",
+        OperationInput::Auth {
+            provider: provider.clone(),
+            request: AuthRequest {
+                step: AuthStep::Poll,
             },
-            local.scope(),
-        )
-        .await
-        .unwrap();
+        },
+        local.scope(),
+    )
+    .await
+    .unwrap();
     let OperationOutput::Auth(AuthResponse::Credentials { values, .. }) = authenticated else {
         panic!("expected successful login");
     };
@@ -1655,38 +1683,38 @@ async fn paid_window_survives_login_and_revoke_clears_it() {
         "hy3-x",
         "paid after login",
     )));
-    let output = runtime
-        .execute(
-            &plugin,
-            "cn",
-            OperationInput::Infer {
-                provider: provider.clone(),
-                request: request(),
-            },
-            local.scope(),
-        )
-        .await
-        .unwrap();
+    let output = run(
+        &runtime,
+        &plugin,
+        "cn",
+        OperationInput::Infer {
+            provider: provider.clone(),
+            request: request(),
+        },
+        local.scope(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         response_wire(output)["choices"][0]["message"]["content"],
         "paid after login"
     );
     assert_eq!(requested_models(&local).last().unwrap(), "hy3-x");
 
-    let revoked = runtime
-        .execute(
-            &plugin,
-            "cn",
-            OperationInput::Auth {
-                provider: provider.clone(),
-                request: AuthRequest {
-                    step: AuthStep::Revoke,
-                },
+    let revoked = run(
+        &runtime,
+        &plugin,
+        "cn",
+        OperationInput::Auth {
+            provider: provider.clone(),
+            request: AuthRequest {
+                step: AuthStep::Revoke,
             },
-            local.scope(),
-        )
-        .await
-        .unwrap();
+        },
+        local.scope(),
+    )
+    .await
+    .unwrap();
     assert!(matches!(
         revoked,
         OperationOutput::Auth(AuthResponse::Revoked)
@@ -1695,18 +1723,18 @@ async fn paid_window_survives_login_and_revoke_clears_it() {
         "hy3",
         "free after revoke",
     )));
-    let output = runtime
-        .execute(
-            &plugin,
-            "cn",
-            OperationInput::Infer {
-                provider,
-                request: request(),
-            },
-            local.scope(),
-        )
-        .await
-        .unwrap();
+    let output = run(
+        &runtime,
+        &plugin,
+        "cn",
+        OperationInput::Infer {
+            provider,
+            request: request(),
+        },
+        local.scope(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         response_wire(output)["choices"][0]["message"]["content"],
         "free after revoke"

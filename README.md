@@ -93,6 +93,8 @@ API Key:  由 Stravia 访问控制配置决定
 
 官方版本变化不会自动放开新参数，须重新核对发行包并更新白名单。
 
+当前客户端身份按区域的官方稳定更新 API 与实际桌面发布包核实：国内 WorkBuddy `5.8.2`、内嵌 CLI `2.161.0`；国际 WorkBuddy AI `5.7.6`、内嵌 CLI `2.156.0`。产品版本同步用于 `X-IDE-Version` 和 User-Agent。来源：[国内更新 API](https://copilot.tencent.com/v2/update?platform=workbuddy-darwin-arm64)、[国际更新 API](https://www.workbuddy.ai/v2/update?platform=workbuddy-darwin-arm64)。独立 npm CLI 的 latest 版本不是桌面应用的内嵌 CLI，不能直接替代其身份字段；上面的白名单引用仍保留其原始核对版本。
+
 ### 模型发现与线路选择
 
 自动发现现在遵循客户端的默认 agent 名单及顺序，不再用 `credits` 字段猜测可选模型，也不回退到全量后端目录。缺少有效名单时明确报错。免费／付费配对来自 `productFeaturesConfig.ModelRateLimitCap.lines`：默认列表只显示 `freeId`，名称优先使用配对的 `displayName`；不按名称合并无关模型。
@@ -110,7 +112,7 @@ API Key:  由 Stravia 访问控制配置决定
 
 ## 自行构建
 
-当前源码通过相对路径使用支持 `ProviderDescriptor.icon_svg` 的 Stravia checkout。插件目录旁的 `worktrees/StraviaPlatform/merfolk/` 必须是对应的完整主仓库，不能只下载本插件源码。发布工作流按同一布局检出 Stravia；`STRAVIA_PLATFORM_REF` 仓库变量可指定 revision，默认固定为已验证的 `dbf1db1718fc4f45fca2aed0a03190505cae1892`。覆盖该变量时，发布前须确保所选 revision 已包含内嵌图标契约，并通过构建及组件验证。
+当前源码使用插件目录旁的完整 `StraviaPlatform/` checkout，五个 Stravia 依赖统一指向 `../StraviaPlatform/backend/crates/...`；不能只下载本插件源码。发布工作流按同一目录关系检出到 `source/StraviaPlatform`；`STRAVIA_PLATFORM_REF` 仓库变量可指定 revision，默认固定 dev 提交 `b32268ab77a02349360fdce0c76805e9d29deebd`，SDK 版本为 `0.4.0`。覆盖该变量前须核对 SDK、protocol-codec 和 vendor-runtime 契约，并通过构建与真实组件验证。
 
 `assets/workbuddy.svg` 使用 [WorkBuddy 官方 SVG](https://download.codebuddy.ai/web/workbuddy/f5bce0c03cdc17fa28d25634fb48d2791c297da3/assets/logo.svg) 的原始 mascot 和双眼几何，去掉背景、渐变及模糊，编译进 Wasm 为透明单色图标。显示需要更新后的 Stravia 宿主并重新导入插件，不在运行时下载品牌资源。图标归属和使用限制见 [NOTICE](NOTICE)。
 
@@ -127,6 +129,12 @@ task dist
 # 单元测试与组件契约验证（契约测试加载 release wasm，须先构建）
 task test
 ```
+
+## Unreleased 升级说明
+
+- 迁移至 Stravia dev 的 owned canonical 请求与显式编码组件执行接口，适配频道请求头声明及 WebSocket reuse-age 参数；保持请求白名单、区域凭据隔离与既有付费线路授权策略不变。
+- 分别更新国内与国际客户端产品及内嵌 CLI 身份，不混用区域发行版本。组件契约检查 `X-IDE-Version` 与 User-Agent 的产品版本一致性，不固定发行版本默认值。
+- 使用锁定 Rust 工具链通过 37 项单元测试与 8 项真实 Wasm 组件契约；独立离线程序加载组件，通过合成 HTTP 响应完成 CN / Intl 授权启动并读取更新后的产品身份。本轮未调用真实账号服务；使用新版须重新构建并导入插件。
 
 ## v0.2.0 升级说明
 

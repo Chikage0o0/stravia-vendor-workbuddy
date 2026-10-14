@@ -63,15 +63,15 @@ impl Region {
 
     pub(crate) fn version(self) -> &'static str {
         match self {
-            Self::Cn => "5.6.2",
-            Self::Intl => "5.6.2",
+            Self::Cn => "5.8.2",
+            Self::Intl => "5.7.6",
         }
     }
 
     pub(crate) fn user_agent(self) -> &'static str {
         match self {
-            Self::Cn => "WorkBuddy/5.6.2 WorkBuddy/5.6.2 CLI/2.147.0",
-            Self::Intl => "WorkBuddy/5.6.2 WorkBuddy AI/5.6.2 CLI/5.6.2",
+            Self::Cn => "WorkBuddy/5.8.2 WorkBuddy/5.8.2 CLI/2.161.0",
+            Self::Intl => "WorkBuddy/5.7.6 WorkBuddy AI/5.7.6 CLI/2.156.0",
         }
     }
 }
