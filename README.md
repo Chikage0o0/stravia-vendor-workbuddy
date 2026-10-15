@@ -112,11 +112,11 @@ API Key:  由 Stravia 访问控制配置决定
 
 ## 自行构建
 
-当前源码使用插件目录旁的完整 `StraviaPlatform/` checkout，五个 Stravia 依赖统一指向 `../StraviaPlatform/backend/crates/...`；不能只下载本插件源码。发布工作流按同一目录关系检出到 `source/StraviaPlatform`；`STRAVIA_PLATFORM_REF` 仓库变量可指定 revision，默认固定 dev 提交 `b32268ab77a02349360fdce0c76805e9d29deebd`，SDK 版本为 `0.4.0`。覆盖该变量前须核对 SDK、protocol-codec 和 vendor-runtime 契约，并通过构建与真实组件验证。
+当前源码使用插件目录旁的完整 `StraviaPlatform/` checkout，五个 Stravia 依赖统一指向 `../StraviaPlatform/backend/crates/...`；不能只下载本插件源码。发布工作流按同一目录关系检出到 `source/StraviaPlatform`；`STRAVIA_PLATFORM_REF` 仓库变量可指定 revision，默认固定 dev 提交 `7fac0bc5af644ae13c389b219700a9c4359181af`，SDK 版本仍为 `0.4.0`。本地 checkout 应使用同一提交。覆盖该变量前须核对 SDK、protocol-codec 和 vendor-runtime 契约，并通过构建与真实组件验证。
 
 `assets/workbuddy.svg` 使用 [WorkBuddy 官方 SVG](https://download.codebuddy.ai/web/workbuddy/f5bce0c03cdc17fa28d25634fb48d2791c297da3/assets/logo.svg) 的原始 mascot 和双眼几何，去掉背景、渐变及模糊，编译进 Wasm 为透明单色图标。显示需要更新后的 Stravia 宿主并重新导入插件，不在运行时下载品牌资源。图标归属和使用限制见 [NOTICE](NOTICE)。
 
-依赖：Rust `1.98.1`（`rust-toolchain.toml` 已锁定）+ `wasm32-wasip2` target；可选安装 [Task](https://taskfile.dev)。
+依赖：Rust `1.99.0`（`rust-toolchain.toml` 已锁定，与上游最低版本一致）+ `wasm32-wasip2` target；可选安装 [Task](https://taskfile.dev)。若环境变量 `RUSTUP_TOOLCHAIN` 覆盖了项目工具链，须清除覆盖或在下列命令中使用 `cargo +1.99.0`。
 
 ```bash
 # 仅构建组件
@@ -132,9 +132,10 @@ task test
 
 ## Unreleased 升级说明
 
-- 迁移至 Stravia dev 的 owned canonical 请求与显式编码组件执行接口，适配频道请求头声明及 WebSocket reuse-age 参数；保持请求白名单、区域凭据隔离与既有付费线路授权策略不变。
+- 对齐上述 Stravia dev 提交的统一 canonical 请求控制，并将最低 Rust 与构建工具链同步升至 `1.99.0`。沿用 SDK 的 owned 请求、参数归一化与显式编码组件执行接口；canonical format 仍为 `1`，不新增旧字段透传或兼容分支。频道请求头声明、WebSocket reuse-age 参数、请求白名单、区域凭据隔离与既有付费线路授权策略保持不变。
 - 分别更新国内与国际客户端产品及内嵌 CLI 身份，不混用区域发行版本。组件契约检查 `X-IDE-Version` 与 User-Agent 的产品版本一致性，不固定发行版本默认值。
-- 使用锁定 Rust 工具链通过 37 项单元测试与 8 项真实 Wasm 组件契约；独立离线程序加载组件，通过合成 HTTP 响应完成 CN / Intl 授权启动并读取更新后的产品身份。本轮未调用真实账号服务；使用新版须重新构建并导入插件。
+- 组件契约覆盖宿主目标 effort 优先于入口 effort，并确认统一缓存参数 `prompt_cache_key` 仍不能绕过官方 CLI 白名单。Chat 目标关闭思考使用 `Effort { value: "none" }`，不使用其它目标协议的 `Disabled` 控制。
+- 使用锁定 Rust 工具链通过 37 项单元测试与 8 项真实 Wasm 组件契约；独立离线程序加载组件，完成 CN / Intl 的 Responses canonical → 协议选择 → Chat SSE 推理，验证思考开启／关闭、目标优先级、JSON Schema、缓存白名单及 usage。本轮未调用真实账号服务；使用新版须重新构建并导入插件。
 
 ## v0.2.0 升级说明
 

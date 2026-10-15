@@ -197,8 +197,8 @@ fn whitelist_request() -> stravia_vendor_sdk::AiRequest {
         .unwrap()
         .decode_request(json!({
             "model":"client-route-name", "stream":true,
-            "temperature":0.25,"top_p":0.8,"max_tokens":123,"reasoning_effort":"medium",
-            "store":true,"prompt_cache_retention":"24h",
+            "temperature":0.25,"top_p":0.8,"max_tokens":123,"reasoning_effort":"high",
+            "store":true,"prompt_cache_retention":"24h","prompt_cache_key":"client-only-cache-key",
             "logit_bias":{"1":1},"logprobs":true,"top_logprobs":2,"n":2,"seed":7,
             "user":"client-user","metadata":{"client":"only"},"service_tier":"auto",
             "stream_options":{"include_usage":true,"include_obfuscation":true},
@@ -229,7 +229,7 @@ fn whitelist_request() -> stravia_vendor_sdk::AiRequest {
             }}]
         }))
         .unwrap();
-    // 宿主完成路由后会选择 Target Thinking Control；codec 不直接编码 ingress effort。
+    // 宿主路由后的目标控制必须覆盖入口 high；统一参数不能绕过此优先级。
     request.reasoning.target_control = Some(
         stravia_runtime_contract::thinking::TargetThinkingControl::Effort {
             value: "medium".into(),
@@ -333,6 +333,7 @@ async fn inference_whitelist_preserves_user_payload_contract() {
             "user",
             "metadata",
             "service_tier",
+            "prompt_cache_key",
         ] {
             assert!(body.get(key).is_none(), "{key} must not be forwarded");
         }
