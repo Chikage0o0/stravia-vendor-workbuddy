@@ -130,7 +130,7 @@ task dist
 task test
 ```
 
-## Unreleased 升级说明
+## v0.2.1 升级说明
 
 - 对齐上述 Stravia dev 提交的统一 canonical 请求控制，并将最低 Rust 与构建工具链同步升至 `1.99.0`。沿用 SDK 的 owned 请求、参数归一化与显式编码组件执行接口；canonical format 仍为 `1`，不新增旧字段透传或兼容分支。频道请求头声明、WebSocket reuse-age 参数、请求白名单、区域凭据隔离与既有付费线路授权策略保持不变。
 - 分别更新国内与国际客户端产品及内嵌 CLI 身份，不混用区域发行版本。组件契约检查 `X-IDE-Version` 与 User-Agent 的产品版本一致性，不固定发行版本默认值。
@@ -148,8 +148,8 @@ task test
 版本号以 `Cargo.toml` 的 `version` 为准。同步更新 `Cargo.lock` 中本插件的版本，运行 `task verify`，提交版本变更并推送后，打 tag 触发 GitHub Action 构建并发布 Release：
 
 ```bash
-git tag -a v0.2.0 -m "发布 v0.2.0"
-git push origin v0.2.0
+git tag -a v0.2.1 -m "发布 v0.2.1"
+git push origin v0.2.1
 ```
 
 tag 的 `v` 前缀版本号必须与 `Cargo.toml` 一致，否则 workflow 拒绝发布。Release 附件包含 `stravia-vendor-workbuddy-v<版本>.wasm`、`SHA256SUMS`、`LICENSE`、`NOTICE` 及第三方组件许可证。
