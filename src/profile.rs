@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use semver::Version;
 use stravia_vendor_sdk::{
     AuthDescriptor, AuthFlow, CANONICAL_FORMAT_VERSION, Capability, ChannelDescriptor, ConfigField,
-    ConfigFieldKind, DataCompatibility, NetworkDeclaration, OriginDeclaration, ProviderDescriptor,
-    VendorDescriptor, VendorKind,
+    ConfigFieldKind, DataCompatibility, NetworkDeclaration, ProviderDescriptor, VendorDescriptor,
+    VendorKind,
 };
 
 use crate::{Region, VENDOR_ID, messages};
@@ -92,15 +92,7 @@ pub(crate) fn descriptor() -> VendorDescriptor {
                 pattern: None,
                 visible_when: None,
             }],
-            // 国内额度属于独立计费域名；聊天与国际额度仍使用各自连接 origin。
-            network: NetworkDeclaration {
-                extra_origins: vec![OriginDeclaration {
-                    scheme: "https".into(),
-                    host: "www.codebuddy.cn".into(),
-                    port: None,
-                }],
-                ..NetworkDeclaration::default()
-            },
+            network: NetworkDeclaration::default(),
             data_compat: DataCompatibility::default(),
         }],
     }

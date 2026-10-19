@@ -112,6 +112,7 @@ fn load_config(
     region: Region,
     headers: Vec<(String, String)>,
 ) -> Result<Value, PluginError> {
+    // 桌面入口由区域配置固定；响应里的 endpoint 不得重写后续请求或扩大网络权限。
     let response = host.http_start(HttpRequest {
         method: "GET".into(),
         url: format!("{}/v3/config", region.origin()),
@@ -205,9 +206,10 @@ fn paid_lines(config: &Value) -> Result<BTreeMap<String, Value>, PluginError> {
         }
         used_ids.insert(free);
         used_ids.insert(paid);
-        let paid_model = parse_models(std::slice::from_ref(paid_row), "account-config")?
+        let mut paid_model = parse_models(std::slice::from_ref(paid_row), "account-config")?
             .models
             .remove(0);
+        apply_transport_metadata(&mut paid_model.metadata, config);
         pairs.insert(
             free.into(),
             json!({
@@ -323,6 +325,7 @@ fn client_catalog(config: &Value) -> Result<DiscoverResponse, PluginError> {
     }
     let mut response = parse_models(selected, "account-config")?;
     for model in &mut response.models {
+        apply_transport_metadata(&mut model.metadata, config);
         if let Some(line) = pairs.get(&model.id) {
             if let Some(name) = line
                 .get("displayName")
@@ -337,6 +340,19 @@ fn client_catalog(config: &Value) -> Result<DiscoverResponse, PluginError> {
         }
     }
     Ok(response)
+}
+
+/// 仅传播官方配置中存在且类型正确的传输属性，不写入私有状态。
+fn apply_transport_metadata(metadata: &mut BTreeMap<String, Value>, config: &Value) {
+    if let Some(deployment) = config.get("deploymentType").and_then(Value::as_str) {
+        metadata.insert("workbuddy_deployment_type".into(), json!(deployment));
+    }
+    if let Some(gzip) = config
+        .pointer("/productFeatures/RequestBodyGzip")
+        .and_then(Value::as_bool)
+    {
+        metadata.insert("workbuddy_request_body_gzip".into(), json!(gzip));
+    }
 }
 
 /// 官方客户端的关思考判定：`onlyReasoning` 的模型恒推理；否则仅当

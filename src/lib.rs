@@ -3,6 +3,7 @@ mod auth;
 mod inference;
 mod models;
 mod profile;
+mod request_context;
 mod state;
 mod messages {
     include!(concat!(env!("OUT_DIR"), "/messages.rs"));
@@ -42,36 +43,36 @@ impl Region {
 
     pub(crate) fn origin(self) -> &'static str {
         match self {
-            Self::Cn => "https://copilot.tencent.com",
+            Self::Cn => "https://www.workbuddy.cn",
             Self::Intl => "https://www.workbuddy.ai",
         }
     }
 
     pub(crate) fn domain(self) -> &'static str {
         match self {
-            Self::Cn => "copilot.tencent.com",
+            Self::Cn => "www.workbuddy.cn",
             Self::Intl => "www.workbuddy.ai",
         }
     }
 
-    pub(crate) fn website(self) -> &'static str {
+    pub(crate) fn auth_platform(self) -> &'static str {
         match self {
-            Self::Cn => "https://www.codebuddy.cn",
-            Self::Intl => self.origin(),
+            Self::Cn => "workbuddy",
+            Self::Intl => "workbuddy-ai",
         }
     }
 
     pub(crate) fn version(self) -> &'static str {
         match self {
-            Self::Cn => "5.8.2",
-            Self::Intl => "5.7.6",
+            Self::Cn => "5.8.3",
+            Self::Intl => "5.8.4",
         }
     }
 
     pub(crate) fn user_agent(self) -> &'static str {
         match self {
-            Self::Cn => "WorkBuddy/5.8.2 WorkBuddy/5.8.2 CLI/2.161.0",
-            Self::Intl => "WorkBuddy/5.7.6 WorkBuddy AI/5.7.6 CLI/2.156.0",
+            Self::Cn => "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0",
+            Self::Intl => "WorkBuddy/5.8.4 WorkBuddy AI/5.8.4 CLI/2.161.0",
         }
     }
 }
@@ -88,7 +89,7 @@ fn admit(channel: &str, provider: &ProviderSnapshot) -> Result<Region, PluginErr
         ));
     }
     let region = Region::from_channel(channel)?;
-    // 连接地址固定到所选区域，避免更换地址或 channel 后向其他区域发送旧凭据。
+    // 连接地址固定到所选区域的新版入口，旧地址与另一地区均不能绕过准入。
     if provider.base_url.trim_end_matches('/') != region.origin() {
         return Err(common::plugin_error(
             ErrorKind::Invalid,

@@ -1,8 +1,8 @@
 //! WorkBuddy 浏览器登录（Start/Poll/Refresh/Revoke）与区域凭据。
 //!
 //! 隔离边界：
-//! - 所有 HTTP 只发往当前 channel 对应区域的固定 origin（`lib.rs` 的 `admit`
-//!   已校验 `provider.base_url` 与 channel 一致）。
+//! - 所有 HTTP 只发往当前 channel 对应区域的固定新版 origin；
+//!   `lib.rs` 的 `admit` 已校验 `provider.base_url` 与该入口一致。
 //! - 凭据内持久化 `region`/`domain` 标签；刷新与出站标头生成前复核，区域
 //!   不一致在任何 HTTP 发出之前失败。
 //! - 待登录状态写入宿主私有状态，仅保存 `{state, region, created}`，不缓存
@@ -29,8 +29,6 @@ const AUTH_STATE_PATH: &str = "/v2/plugin/auth/state";
 const AUTH_TOKEN_PATH: &str = "/v2/plugin/auth/token";
 /// 刷新并轮换令牌。
 const AUTH_REFRESH_PATH: &str = "/v2/plugin/auth/token/refresh";
-/// 上游唯一接受的 `platform` 取值。
-const PLATFORM: &str = "CLI";
 /// 业务错误码：浏览器尚未完成授权。
 const LOGIN_PENDING: i64 = 11217;
 /// 登录窗口有效期。
@@ -84,13 +82,18 @@ pub(crate) fn execute(
 
 /// 发起登录：POST /v2/plugin/auth/state，保存待登录 state，返回授权地址。
 fn start(host: &GuestHost, region: Region) -> Result<AuthResponse, PluginError> {
-    let url = format!("{}{}?platform={PLATFORM}", region.origin(), AUTH_STATE_PATH);
+    let url = format!(
+        "{}{}?platform={}",
+        region.origin(),
+        AUTH_STATE_PATH,
+        region.auth_platform()
+    );
     let payload = json_request(
         host,
         "POST",
         &url,
         auth_endpoint_headers(region),
-        b"{}".to_vec(),
+        Vec::new(),
     )?;
     reject_nonzero_code(&payload)?;
     let data = payload.get("data").unwrap_or(&Value::Null);
@@ -175,13 +178,7 @@ fn refresh(
     let mut request_headers = auth_endpoint_headers(region);
     request_headers.extend([
         ("X-Refresh-Token".to_owned(), refresh_token.clone()),
-        (
-            "X-Auth-Refresh-Source".to_owned(),
-            match region {
-                Region::Cn => "workbuddy".to_owned(),
-                Region::Intl => "plugin".to_owned(),
-            },
-        ),
+        ("X-Auth-Refresh-Source".to_owned(), "plugin".to_owned()),
         ("X-User-Id".to_owned(), stored.uid.clone()),
         ("X-Domain".to_owned(), stored.domain.clone()),
         ("X-CodeBuddy-Request".to_owned(), "1".to_owned()),
@@ -278,8 +275,8 @@ pub(crate) fn headers(
             "Accept".to_owned(),
             "application/json, text/plain, */*".to_owned(),
         ),
-        ("Origin".to_owned(), region.website().to_owned()),
-        ("Referer".to_owned(), format!("{}/", region.website())),
+        ("Origin".to_owned(), region.origin().to_owned()),
+        ("Referer".to_owned(), format!("{}/", region.origin())),
         ("X-CodeBuddy-Request".to_owned(), "1".to_owned()),
         (
             "Accept-Language".to_owned(),
@@ -303,6 +300,13 @@ pub(crate) fn inference_headers(
     let access_token = stored
         .access_token
         .ok_or_else(|| auth_error("WorkBuddy access token is missing"))?;
+    let product = provider
+        .model_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.extensions.get("workbuddy_deployment_type"))
+        .and_then(Value::as_str)
+        .unwrap_or("SaaS");
+    check_header_safe("workbuddy_deployment_type", product)?;
     let mut headers = vec![
         ("Content-Type".to_owned(), "application/json".to_owned()),
         ("X-Requested-With".to_owned(), "XMLHttpRequest".to_owned()),
@@ -311,7 +315,7 @@ pub(crate) fn inference_headers(
         ("X-IDE-Name".to_owned(), "WorkBuddy".to_owned()),
         ("X-IDE-Type".to_owned(), "WorkBuddy".to_owned()),
         ("X-IDE-Version".to_owned(), region.version().to_owned()),
-        ("X-Product".to_owned(), "WorkBuddy".to_owned()),
+        ("X-Product".to_owned(), product.to_owned()),
         ("X-Domain".to_owned(), stored.domain),
         ("User-Agent".to_owned(), region.user_agent().to_owned()),
         ("X-User-Id".to_owned(), stored.uid),
@@ -333,27 +337,32 @@ pub(crate) fn billing_headers(
     let token = stored
         .access_token
         .ok_or_else(|| auth_error("WorkBuddy access token is missing"))?;
-    // 计费接口使用网页侧标头，不使用对话接口的 WorkBuddy IDE 身份。
-    let mut headers = auth_endpoint_headers(region);
-    headers.extend([
+    // 新版桌面额度接口使用轻量账号头；保留产品 UA 与请求 ID，缺失时上游会拒绝。
+    let mut headers = vec![
+        ("Content-Type".into(), "application/json".into()),
+        ("Accept".into(), "application/json".into()),
+        (
+            "User-Agent".into(),
+            format!("WorkBuddy/{}", region.version()),
+        ),
         ("Authorization".into(), format!("Bearer {token}")),
         ("X-User-Id".into(), stored.uid),
         ("X-Domain".into(), stored.domain),
-        ("X-CodeBuddy-Request".into(), "1".into()),
-        ("Accept-Language".into(), accept_language(region).into()),
+        (
+            "Accept-Language".into(),
+            match region {
+                Region::Cn => "zh".into(),
+                Region::Intl => "en".into(),
+            },
+        ),
         (
             "X-Request-ID".into(),
             uuid::Uuid::new_v4().simple().to_string(),
         ),
-    ]);
+    ];
     if let Some(id) = stored.enterprise_id {
         headers.push(("X-Enterprise-Id".into(), id.clone()));
         headers.push(("X-Tenant-Id".into(), id));
-    } else {
-        headers.push(("X-No-Enterprise-Id".into(), "1".into()));
-    }
-    if region == Region::Cn {
-        headers.push(("X-Product".into(), "SaaS".into()));
     }
     Ok(headers)
 }
@@ -575,8 +584,8 @@ fn auth_endpoint_headers(region: Region) -> Vec<(String, String)> {
             "User-Agent".to_owned(),
             format!("WorkBuddy/{}", region.version()),
         ),
-        ("Origin".to_owned(), region.website().to_owned()),
-        ("Referer".to_owned(), format!("{}/", region.website())),
+        ("Origin".to_owned(), region.origin().to_owned()),
+        ("Referer".to_owned(), format!("{}/", region.origin())),
     ]
 }
 
@@ -763,10 +772,10 @@ mod tests {
 
     #[test]
     fn authorization_url_requires_plain_https() {
-        assert!(validate_authorization_url("https://copilot.tencent.com/login?x=1").is_ok());
-        assert!(validate_authorization_url("http://copilot.tencent.com/login").is_err());
-        assert!(validate_authorization_url("https://user:pass@copilot.tencent.com/login").is_err());
-        assert!(validate_authorization_url("https://user@copilot.tencent.com/login").is_err());
+        assert!(validate_authorization_url("https://www.workbuddy.cn/login?x=1").is_ok());
+        assert!(validate_authorization_url("http://www.workbuddy.cn/login").is_err());
+        assert!(validate_authorization_url("https://user:pass@www.workbuddy.cn/login").is_err());
+        assert!(validate_authorization_url("https://user@www.workbuddy.cn/login").is_err());
         assert!(validate_authorization_url("not a url").is_err());
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "stravia-vendor-workbuddy"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.99.0"
 license = "MIT"
@@ -24,6 +24,10 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rust_decimal = { version = "1.43", default-features = false, features = ["std"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry-propagator-b3 = "0.33"
 
 [build-dependencies]
 serde = { version = "1", features = ["derive"] }

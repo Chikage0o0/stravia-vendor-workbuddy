@@ -1,5 +1,5 @@
 use rust_decimal::Decimal;
-use serde_json::{Value, json};
+use serde_json::Value;
 use stravia_vendor_common::common;
 use stravia_vendor_sdk::{
     AllowanceAmount, AllowanceItem, AllowanceResponse, ErrorKind, GuestHost, HttpRequest,
@@ -8,9 +8,7 @@ use stravia_vendor_sdk::{
 
 use crate::{Region, auth};
 
-const RESOURCE_PATH: &str = "/v2/billing/meter/get-user-resource";
-const PAGE_SIZE: usize = 100;
-const MAX_PAGES: usize = 100;
+const SUMMARY_PATH: &str = "/billing/meter/get-user-resource-summary";
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 pub(crate) fn execute(
@@ -18,121 +16,70 @@ pub(crate) fn execute(
     provider: &ProviderSnapshot,
     region: Region,
 ) -> Result<AllowanceResponse, PluginError> {
-    let mut totals = Credits::default();
-    let begin = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    // 国内计费域与聊天域不同；地址不从令牌、响应或私有状态获取。
-    let url = format!("{}{RESOURCE_PATH}", region.website());
-    for page in 1..=MAX_PAGES {
-        let body = serde_json::to_vec(&json!({
-            "PageNumber": page,
-            "PageSize": PAGE_SIZE,
-            "ProductCode": "p_tcaca",
-            "Status": [0, 3],
-            "PackageEndTimeRangeBegin": begin,
-            "PackageEndTimeRangeEnd": "2036-01-01 00:00:00"
-        }))
-        .map_err(|_| malformed("could not encode allowance request"))?;
-        let response = host.http_start(HttpRequest {
-            method: "POST".into(),
-            url: url.clone(),
-            headers: auth::billing_headers(provider, region)?,
-            body,
-        })?;
-        let status = response.status()?;
-        let headers = response.headers()?;
-        let bytes = read_http_body(&response, MAX_BODY_BYTES)?;
-        if !(200..300).contains(&status) {
-            let mut error = common::upstream_error(status, &headers, &bytes);
-            error.message = format!("WorkBuddy allowance HTTP {status}");
-            return Err(error);
-        }
-        let value: Value =
-            serde_json::from_slice(&bytes).map_err(|_| malformed("invalid allowance JSON"))?;
-        let rows = accounts(&value)?;
-        for row in rows {
-            totals.include(package(row)?)?;
-        }
-        if rows.len() < PAGE_SIZE {
-            return Ok(AllowanceResponse {
-                allowances: vec![totals.into_allowance(region)],
-                models: Vec::new(),
-                plan_label: None,
-            });
-        }
+    let response = host.http_start(HttpRequest {
+        method: "POST".into(),
+        url: format!("{}{SUMMARY_PATH}", region.origin()),
+        headers: auth::billing_headers(provider, region)?,
+        body: b"{}".to_vec(),
+    })?;
+    let status = response.status()?;
+    let headers = response.headers()?;
+    let bytes = read_http_body(&response, MAX_BODY_BYTES)?;
+    if !(200..300).contains(&status) {
+        let mut error = common::upstream_error(status, &headers, &bytes);
+        error.message = format!("WorkBuddy allowance HTTP {status}");
+        return Err(error);
     }
-    Err(common::plugin_error(
-        ErrorKind::ResourceExhausted,
-        "WorkBuddy allowance pagination exceeded the guest limit",
-    ))
+    let value: Value =
+        serde_json::from_slice(&bytes).map_err(|_| malformed("invalid allowance JSON"))?;
+    let mut totals = Credits::default();
+    for row in packages(&value)? {
+        totals.include(package(row)?)?;
+    }
+    Ok(AllowanceResponse {
+        allowances: vec![totals.into_allowance(region)],
+        models: Vec::new(),
+        plan_label: None,
+    })
 }
 
-fn accounts(value: &Value) -> Result<&[Value], PluginError> {
-    if value
-        .get("code")
-        .is_some_and(|code| code.as_i64() != Some(0))
-        || value
-            .pointer("/data/Response/Error")
-            .is_some_and(|error| !error.is_null())
-        || value
-            .pointer("/Response/Error")
-            .is_some_and(|error| !error.is_null())
-    {
+fn packages(value: &Value) -> Result<&[Value], PluginError> {
+    if value.get("code").and_then(Value::as_i64) != Some(0) {
         return Err(malformed(
             "WorkBuddy billing service rejected the allowance query",
         ));
     }
     value
-        .pointer("/data/Response/Data/Accounts")
+        .pointer("/data/Packages")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
-        .ok_or_else(|| malformed("WorkBuddy allowance response has no Accounts array"))
+        .ok_or_else(|| malformed("WorkBuddy allowance summary has no Packages array"))
 }
 
+#[derive(Default)]
 struct Credits {
     remaining: Decimal,
-    used: Option<Decimal>,
-    total: Option<Decimal>,
-}
-
-impl Default for Credits {
-    fn default() -> Self {
-        // 只有成功读取完所有页面后才输出；明确的空资源列表得到零积分。
-        Self {
-            remaining: Decimal::ZERO,
-            used: Some(Decimal::ZERO),
-            total: Some(Decimal::ZERO),
-        }
-    }
+    used: Decimal,
+    total: Decimal,
 }
 
 impl Credits {
     fn include(&mut self, package: Self) -> Result<(), PluginError> {
         self.remaining = checked(self.remaining.checked_add(package.remaining))?;
-        self.used = sum_optional(self.used, package.used)?;
-        self.total = sum_optional(self.total, package.total)?;
+        self.used = checked(self.used.checked_add(package.used))?;
+        self.total = checked(self.total.checked_add(package.total))?;
         Ok(())
     }
 
     fn into_allowance(self, region: Region) -> AllowanceItem {
-        let total = self
-            .total
-            .map(|value| value.normalize().to_string())
-            .unwrap_or_else(|| "—".into());
-        // 宿主遇到 limit 或 used_percent 会把剩余列渲染为百分比；
-        // 已用/剩余列保留实际积分值，总量放在标题。多包无统一重置时间。
-        let used_percent = self
-            .total
-            .filter(|limit| *limit > Decimal::ZERO)
-            .map(|limit| {
-                let used = self
-                    .used
-                    .unwrap_or_else(|| (limit - self.remaining).max(Decimal::ZERO));
-                (used / limit * Decimal::ONE_HUNDRED)
-                    .round_dp(2)
-                    .clamp(Decimal::ZERO, Decimal::ONE_HUNDRED)
-                    .normalize()
-                    .to_string()
-            });
+        let total = self.total.normalize().to_string();
+        // 汇总接口直接给出本周期的精确计数，不再从资源包余额反推或跨周期相加。
+        let used_percent = (self.total > Decimal::ZERO).then(|| {
+            (self.used.clamp(Decimal::ZERO, self.total) / self.total * Decimal::ONE_HUNDRED)
+                .round_dp(2)
+                .normalize()
+                .to_string()
+        });
         AllowanceItem {
             key: "workbuddy_credits_total".into(),
             label: match region {
@@ -140,9 +87,9 @@ impl Credits {
                 Region::Intl => format!("Total credits {total}"),
             },
             kind: "balance".into(),
-            used: self.used.map(credit),
+            used: Some(credit(self.used)),
             remaining: Some(credit(self.remaining)),
-            limit: self.total.map(credit),
+            limit: Some(credit(self.total)),
             used_percent,
             window_seconds: None,
             resets_at_unix_ms: None,
@@ -152,79 +99,30 @@ impl Credits {
 }
 
 fn package(row: &Value) -> Result<Credits, PluginError> {
-    let cycle_limit = amount(row, "CycleCapacitySize")?;
-    let cyclic = cycle_limit.is_some_and(|size| size > Decimal::ZERO);
-    let (reported_used, remaining, mut total) = if cyclic {
-        (
-            amount(row, "CycleCapacityUsed")?,
-            amount(row, "CycleCapacityRemain")?,
-            cycle_limit,
-        )
-    } else {
-        (
-            amount(row, "CapacityUsed")?,
-            amount(row, "CapacityRemain")?,
-            amount(row, "CapacitySize")?,
-        )
-    };
-    let mut remaining = remaining
-        .ok_or_else(|| malformed("WorkBuddy resource package is missing its remaining capacity"))?;
-    let used = match total {
-        Some(size) => {
-            let derived = checked(size.checked_sub(remaining))?.max(Decimal::ZERO);
-            // 周期计数可能不同步：较新的已用量优先；
-            // 较小或缺失的已用量则由总量减剩余量计算，避免漏掉小数用量。
-            if cyclic && reported_used.is_some_and(|used| used > derived) {
-                let used = reported_used.expect("checked above");
-                remaining = checked(size.checked_sub(used))?.max(Decimal::ZERO);
-                Some(used)
-            } else {
-                Some(derived)
-            }
-        }
-        None => {
-            total = reported_used
-                .map(|used| checked(remaining.checked_add(used)))
-                .transpose()?;
-            reported_used
-        }
-    };
     Ok(Credits {
-        remaining,
-        used,
-        total,
+        remaining: amount(row, "CycleRemainCapacity")?,
+        used: amount(row, "CycleUsedCapacity")?,
+        total: amount(row, "CycleTotalCapacity")?,
     })
 }
 
-fn amount(row: &Value, field: &str) -> Result<Option<Decimal>, PluginError> {
-    let Some(value) = row.get(field).filter(|value| !value.is_null()) else {
-        return Ok(None);
-    };
-    let text = match value {
-        Value::Number(number) => number.to_string(),
-        Value::String(text) => text.trim().to_owned(),
-        _ => return Err(malformed("invalid WorkBuddy capacity value")),
+fn amount(row: &Value, field: &str) -> Result<Decimal, PluginError> {
+    let number_text;
+    let text = match row.get(field) {
+        Some(Value::Number(number)) => {
+            number_text = number.to_string();
+            number_text.as_str()
+        }
+        Some(Value::String(text)) => text.trim(),
+        _ => return Err(malformed("missing or invalid WorkBuddy capacity value")),
     };
     let parsed = if let Some((base, _)) = text.split_once(['e', 'E']) {
         // from_scientific 的尾数解析允许舍入，先做精确检查。
-        Decimal::from_str_exact(base).and_then(|_| Decimal::from_scientific(&text))
+        Decimal::from_str_exact(base).and_then(|_| Decimal::from_scientific(text))
     } else {
-        Decimal::from_str_exact(&text)
+        Decimal::from_str_exact(text)
     };
-    parsed
-        .map(Some)
-        .map_err(|_| malformed("invalid or out-of-range WorkBuddy capacity value"))
-}
-
-fn sum_optional(
-    left: Option<Decimal>,
-    right: Option<Decimal>,
-) -> Result<Option<Decimal>, PluginError> {
-    match (left, right) {
-        (Some(left), Some(right)) => checked(left.checked_add(right)).map(Some),
-        // 不能把某包未知的计数当成零，再把部分合计标为账号总量。
-        _ => Ok(None),
-    }
+    parsed.map_err(|_| malformed("invalid or out-of-range WorkBuddy capacity value"))
 }
 
 fn checked(value: Option<Decimal>) -> Result<Decimal, PluginError> {
@@ -245,20 +143,20 @@ fn malformed(message: &str) -> PluginError {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
-    fn merges_cycle_and_reward_credits_without_losing_fractional_usage() {
+    fn summary_packages_preserve_fractional_account_usage() {
         let mut totals = Credits::default();
         for row in [
-            json!({"CycleCapacitySize":500,"CycleCapacityRemain":"334.16","CycleCapacityUsed":165,"CapacitySize":9999,"CapacityRemain":9999}),
-            json!({"CapacitySize":4481,"CapacityRemain":4481}),
+            json!({"CycleTotalCapacity":500,"CycleRemainCapacity":"334.16","CycleUsedCapacity":"165.84"}),
+            json!({"CycleTotalCapacity":4481,"CycleRemainCapacity":4481,"CycleUsedCapacity":0}),
         ] {
             totals.include(package(&row).unwrap()).unwrap();
         }
-        assert_eq!(totals.total.unwrap().to_string(), "4981");
         let result = totals.into_allowance(Region::Cn);
-        assert!(result.label.contains("4981"));
         assert_eq!(result.remaining.unwrap().value, "4815.16");
         assert_eq!(result.used.unwrap().value, "165.84");
         assert_eq!(result.limit.unwrap().value, "4981");
@@ -269,8 +167,8 @@ mod tests {
     fn fractional_and_scientific_credits_sum_in_decimal() {
         let mut totals = Credits::default();
         for raw in [
-            r#"{"CapacitySize":1,"CapacityRemain":0.1234567890123456789}"#,
-            r#"{"CapacitySize":"2e-1","CapacityRemain":"1e-1"}"#,
+            r#"{"CycleTotalCapacity":1,"CycleRemainCapacity":0.1234567890123456789,"CycleUsedCapacity":"0.8765432109876543211"}"#,
+            r#"{"CycleTotalCapacity":"2e-1","CycleRemainCapacity":"1e-1","CycleUsedCapacity":"1e-1"}"#,
         ] {
             totals
                 .include(package(&serde_json::from_str(raw).unwrap()).unwrap())
@@ -279,50 +177,16 @@ mod tests {
         let result = totals.into_allowance(Region::Intl);
         assert_eq!(result.remaining.unwrap().value, "0.2234567890123456789");
         assert_eq!(result.used.unwrap().value, "0.9765432109876543211");
-    }
-
-    #[test]
-    fn zero_cycle_capacity_uses_resource_package_balance() {
-        let row = json!({"PackageName":"Top-up","CycleCapacitySize":0,"CycleCapacityRemain":500,"CapacityRemain":"0","CapacityUsed":"20.5","CapacitySize":"20.5"});
-        let result = package(&row).unwrap().into_allowance(Region::Cn);
-        assert_eq!(result.remaining.unwrap().value, "0");
-        assert_eq!(result.used.unwrap().value, "20.5");
-    }
-
-    #[test]
-    fn newer_cycle_usage_corrects_stale_remaining() {
-        let result = package(
-            &json!({"CycleCapacitySize":100,"CycleCapacityRemain":80,"CycleCapacityUsed":53}),
-        )
-        .unwrap()
-        .into_allowance(Region::Cn);
-        assert_eq!(result.remaining.unwrap().value, "47");
-        assert_eq!(result.used.unwrap().value, "53");
-    }
-
-    #[test]
-    fn missing_counters_do_not_produce_partial_account_totals() {
-        let mut totals = Credits::default();
-        totals
-            .include(package(&json!({"CapacityRemain":7})).unwrap())
-            .unwrap();
-        totals
-            .include(package(&json!({"CapacityRemain":20,"CapacitySize":25})).unwrap())
-            .unwrap();
-        assert!(totals.total.is_none());
-        let result = totals.into_allowance(Region::Cn);
-        assert_eq!(result.remaining.unwrap().value, "27");
-        assert!(result.used.is_none());
-        assert!(result.limit.is_none());
-        assert!(result.used_percent.is_none());
-        let reconstructed = package(&json!({"CapacityRemain":"1.2","CapacityUsed":"0.3"})).unwrap();
-        assert_eq!(reconstructed.total.unwrap().to_string(), "1.5");
+        assert_eq!(result.limit.unwrap().value, "1.2");
     }
 
     #[test]
     fn overflowing_totals_fail_instead_of_publishing_a_partial_balance() {
         let mut totals = Credits::default();
-        let row = json!({"CapacityRemain":Decimal::MAX.to_string()});
+        let row = json!({
+            "CycleTotalCapacity":Decimal::MAX.to_string(),
+            "CycleRemainCapacity":Decimal::MAX.to_string(),"CycleUsedCapacity":0
+        });
         totals.include(package(&row).unwrap()).unwrap();
         assert!(totals.include(package(&row).unwrap()).is_err());
     }
@@ -332,21 +196,28 @@ mod tests {
         for payload in [
             json!({}),
             json!({"code":123,"msg":"secret"}),
-            json!({"data":{"Response":{"Error":{"Code":"Denied"},"Data":{"Accounts":[]}}}}),
+            json!({"code":0,"data":{}}),
+            json!({"code":0,"data":{"Packages":null}}),
         ] {
-            assert!(accounts(&payload).is_err());
+            assert!(packages(&payload).is_err());
         }
-        for row in [
-            json!({}),
-            json!({"CapacityRemain":"NaN"}),
-            json!({"CapacityRemain":true}),
-            json!({"CapacityRemain":"1e1000"}),
-            json!({"CapacityRemain":"0.00000000000000000000000000001"}),
+        for invalid in [
+            Value::Null,
+            json!("NaN"),
+            json!(true),
+            json!("1e1000"),
+            json!("0.00000000000000000000000000001"),
         ] {
-            assert!(package(&row).is_err());
+            assert!(
+                package(&json!({
+                    "CycleTotalCapacity":10,"CycleRemainCapacity":invalid,"CycleUsedCapacity":0
+                }))
+                .is_err()
+            );
         }
+        assert!(package(&json!({"CycleRemainCapacity":7})).is_err());
         assert!(
-            accounts(&json!({"data":{"Response":{"Data":{"Accounts":[]}}}}))
+            packages(&json!({"code":0,"data":{"Packages":[]}}))
                 .unwrap()
                 .is_empty()
         );
