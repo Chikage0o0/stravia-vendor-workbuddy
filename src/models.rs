@@ -347,6 +347,15 @@ fn apply_transport_metadata(metadata: &mut BTreeMap<String, Value>, config: &Val
     if let Some(deployment) = config.get("deploymentType").and_then(Value::as_str) {
         metadata.insert("workbuddy_deployment_type".into(), json!(deployment));
     }
+    if let Some(disable_optimization) = config
+        .pointer("/productFeatures/DisableYuanbaoChannel")
+        .and_then(Value::as_bool)
+    {
+        metadata.insert(
+            "workbuddy_disable_model_optimization".into(),
+            json!(disable_optimization),
+        );
+    }
     if let Some(gzip) = config
         .pointer("/productFeatures/RequestBodyGzip")
         .and_then(Value::as_bool)

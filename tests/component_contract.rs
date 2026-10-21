@@ -5,7 +5,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use stravia_protocol_codec::transform::ProtocolTransform;
@@ -13,11 +16,11 @@ use stravia_runtime_contract::{CancellationToken, Deadline};
 use stravia_vendor_common::common;
 use stravia_vendor_runtime::{
     HostFailure, HostHttpResponse, HostServices, HostWebSocket, HttpRequest, LoadedPlugin,
-    LogLevel, OperationScope, RuntimeError, RuntimeEvent, VendorRuntime,
+    LogLevel, OperationScope, RuntimeError, RuntimeEvent, VendorRuntime, WsRequest,
 };
 use stravia_vendor_sdk::{
     AllowanceRequest, AuthRequest, AuthResponse, AuthStep, DiscoverRequest, ErrorKind,
-    OperationInput, OperationOutput, ProviderSnapshot,
+    HttpContentCoding, OperationInput, OperationOutput, ProviderSnapshot,
 };
 
 struct Reply {
@@ -95,6 +98,15 @@ impl HostServices for LocalUpstream {
             self.origins.contains(&url.origin().ascii_serialization()),
             "HTTP destination must be declared and approved"
         );
+        if url.path() == "/v2/chat/completions" {
+            let _ = application_request_body(&request);
+        } else {
+            assert!(
+                request.compression.is_none(),
+                "authentication, configuration, and allowance calls must retain legacy HTTP policy"
+            );
+            assert_no_compression_headers(&request);
+        }
         self.requests.lock().push(request);
         Ok(Arc::new(
             self.replies
@@ -103,14 +115,7 @@ impl HostServices for LocalUpstream {
                 .expect("unexpected HTTP request or retry"),
         ))
     }
-    async fn ws_connect(
-        &self,
-        _: String,
-        _: Vec<(String, String)>,
-        _: Vec<String>,
-        _: Option<String>,
-        _: Option<u64>,
-    ) -> Result<Arc<dyn HostWebSocket>, HostFailure> {
+    async fn ws_connect(&self, _: WsRequest) -> Result<Arc<dyn HostWebSocket>, HostFailure> {
         Err(HostFailure::new(
             ErrorKind::Unsupported,
             "WebSocket is not allowed in this contract",
@@ -198,21 +203,63 @@ fn request_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
-fn decoded_request_body(request: &HttpRequest) -> Value {
-    let mut decoded = Vec::new();
-    let bytes = match request_header(request, "content-encoding") {
-        None => request.body.as_slice(),
-        Some("gzip") => {
-            std::io::Read::read_to_end(
-                &mut flate2::read::GzDecoder::new(request.body.as_slice()),
-                &mut decoded,
-            )
-            .unwrap();
-            decoded.as_slice()
-        }
-        Some(other) => panic!("unexpected request content encoding: {other}"),
-    };
-    serde_json::from_slice(bytes).unwrap()
+fn assert_no_chat_identity_headers(request: &HttpRequest) {
+    assert!(
+        request.headers.iter().all(|(name, _)| {
+            !name
+                .get(.."x-stainless-".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-stainless-"))
+        }),
+        "SDK chat profile must not leak into discovery or allowance requests"
+    );
+    for name in [
+        "x-userinfo",
+        "x-private-data",
+        "x-agent-intent",
+        "x-agent-type",
+        "x-agent-purpose",
+    ] {
+        assert!(
+            request_header(request, name).is_none(),
+            "{name} is chat-only and must not appear on discovery or allowance requests"
+        );
+    }
+}
+
+fn assert_no_compression_headers(request: &HttpRequest) {
+    for name in ["accept-encoding", "content-encoding", "content-length"] {
+        assert!(
+            request_header(request, name).is_none(),
+            "{name} must be owned by the host, not the guest"
+        );
+    }
+}
+
+fn application_request_body(request: &HttpRequest) -> Value {
+    assert_no_compression_headers(request);
+    let compression = request
+        .compression
+        .as_ref()
+        .expect("chat must explicitly opt into host-owned compression, even for identity");
+    assert!(
+        compression.response.is_empty(),
+        "chat responses must retain identity-only negotiation"
+    );
+    serde_json::from_slice(&request.body)
+        .expect("the host must receive original application JSON bytes, not precompressed bytes")
+}
+
+fn assert_chat_compression(request: &HttpRequest, gzip: bool) {
+    let _ = application_request_body(request);
+    let coding = &request.compression.as_ref().unwrap().request;
+    if gzip {
+        assert!(matches!(coding, Some(HttpContentCoding::Gzip)));
+    } else {
+        assert!(
+            coding.is_none(),
+            "the official gzip switch must disable request coding"
+        );
+    }
 }
 
 fn whitelist_request() -> stravia_vendor_sdk::AiRequest {
@@ -347,7 +394,8 @@ async fn inference_whitelist_preserves_user_payload_contract() {
         assert_eq!(requests.len(), 1);
         let chat = &requests[0];
         assert_eq!(chat.url, format!("{origin}/v2/chat/completions"));
-        let body = decoded_request_body(chat);
+        assert_chat_compression(chat, true);
+        let body = application_request_body(chat);
         assert!(body.get("x_client_only").is_none());
         for key in [
             "logit_bias",
@@ -655,6 +703,7 @@ async fn regional_auth_streaming_and_failure_contract() {
         )
         .await
         .unwrap();
+        assert_no_chat_identity_headers(local.requests.lock().last().unwrap());
         let OperationOutput::Discover(discovered) = discovered else {
             panic!("expected discovered models")
         };
@@ -699,7 +748,8 @@ async fn regional_auth_streaming_and_failure_contract() {
             let requests = local.requests.lock();
             let chat = requests.last().unwrap();
             assert_eq!(chat.url, format!("{origin}/v2/chat/completions"));
-            let body = decoded_request_body(chat);
+            assert_chat_compression(chat, true);
+            let body = application_request_body(chat);
             assert_eq!(body["model"], "test-model");
             let user = body["messages"]
                 .as_array()
@@ -854,6 +904,7 @@ async fn regional_allowance_contract() {
             ("region".into(), json!(region)),
             ("domain".into(), json!(domain)),
             ("uid".into(), json!("quota-account")),
+            ("enterprise_id".into(), json!("quota-tenant")),
             (
                 "access_token".into(),
                 json!(token(domain, "quota-account", 1)),
@@ -903,6 +954,7 @@ async fn regional_allowance_contract() {
                 format!("{origin}/billing/meter/get-user-resource-summary")
             );
             assert_eq!(request.method, "POST");
+            assert_no_chat_identity_headers(request);
             let body: Value = serde_json::from_slice(&request.body).unwrap();
             assert_eq!(body, json!({}));
             assert!(
@@ -1016,6 +1068,7 @@ async fn default_agent_models_merge_free_and_paid_lines() {
         ("region".into(), json!("cn")),
         ("domain".into(), json!("www.workbuddy.cn")),
         ("uid".into(), json!("account-a")),
+        ("enterprise_id".into(), json!("discovery-tenant")),
         (
             "access_token".into(),
             json!(token("www.workbuddy.cn", "account-a", 1)),
@@ -1023,7 +1076,7 @@ async fn default_agent_models_merge_free_and_paid_lines() {
     ]);
     local.reply(Reply::json(json!({"code":0,"data":{
         "deploymentType":"configured-product",
-        "productFeatures":{"RequestBodyGzip":false},
+        "productFeatures":{"RequestBodyGzip":false,"DisableYuanbaoChannel":true},
         "models":[
             {"id":"old-model","name":"Old model","credits":"x0.79"},
             {"id":"hy4-preview","name":"Hy4 preview","credits":"x0.29"},
@@ -1095,7 +1148,21 @@ async fn default_agent_models_merge_free_and_paid_lines() {
     }
     assert!(local.events.lock().is_empty());
     assert!(local.replies.lock().is_empty());
-    let selected = discovered.models.into_iter().nth(1).unwrap();
+    let mut selected = discovered.models.into_iter().nth(1).unwrap();
+    assert_eq!(
+        selected
+            .metadata
+            .get("workbuddy_disable_model_optimization"),
+        Some(&json!(true)),
+        "the official privacy switch must reach the selected model"
+    );
+    selected.metadata.get_mut("workbuddy_paid_line").unwrap()["paidMetadata"]["workbuddy_disable_model_optimization"] =
+        json!(false);
+    assert_eq!(
+        selected.metadata.get("workbuddy_request_body_gzip"),
+        Some(&json!(false)),
+        "the official RequestBodyGzip switch must reach the selected model"
+    );
     provider.model = Some(selected.id);
     provider.model_metadata = Some(stravia_vendor_sdk::ModelMetadata {
         extensions: selected.metadata,
@@ -1127,21 +1194,202 @@ async fn default_agent_models_merge_free_and_paid_lines() {
     );
     assert_eq!(requested_models(&local), ["hy3", "hy3-x"]);
     for wire_request in local.requests.lock().iter() {
-        assert!(request_header(wire_request, "content-encoding").is_none());
-        if wire_request.method == "POST" {
+        if wire_request.url.ends_with("/v2/chat/completions") {
+            assert_chat_compression(wire_request, false);
+            assert_eq!(request_header(wire_request, "x-private-data"), Some("true"));
             assert_eq!(
                 request_header(wire_request, "x-product"),
                 Some("configured-product")
             );
             assert_eq!(
-                decoded_request_body(wire_request)["messages"][1]["content"],
+                application_request_body(wire_request)["messages"][1]["content"],
                 "你好"
             );
+        } else {
+            assert_no_chat_identity_headers(wire_request);
         }
     }
     println!(
         "default agent: roster and paid lines preserved; configured transport honored across a paid retry"
     );
+}
+
+#[tokio::test]
+#[ignore = "build the release wasm32-wasip2 component first"]
+async fn regional_chat_identity_isolation_and_client_header_injection_contract() {
+    let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/wasm32-wasip2/release/stravia_vendor_workbuddy.wasm");
+    let runtime = VendorRuntime::new().unwrap();
+    let plugin = runtime
+        .load(&std::fs::read(artifact).unwrap())
+        .await
+        .unwrap();
+    for (region, domain) in [("cn", "www.workbuddy.cn"), ("intl", "www.workbuddy.ai")] {
+        let origin = format!("https://{domain}");
+        let local = LocalUpstream::new(&[&origin]);
+        let mut provider = snapshot(region, &origin);
+        let tenant = format!("tenant-{region}");
+        provider.credentials = BTreeMap::from([
+            ("region".into(), json!(region)),
+            ("domain".into(), json!(domain)),
+            ("uid".into(), json!("identity-account")),
+            ("enterprise_id".into(), json!(tenant)),
+            (
+                "access_token".into(),
+                json!(token(domain, "identity-account", 1)),
+            ),
+        ]);
+        let source_only_headers = [
+            "x-auth-method",
+            "x-id-source",
+            "x-device-token",
+            "x-device-id-list",
+            "x-parent-conversation-id",
+            "x-compaction",
+            "x-context-compacted",
+            "x-stainless-client-only",
+            "x-stainless-helper-method",
+            "x-stainless-poll-helper",
+        ];
+        let sdk_headers = [
+            "x-stainless-lang",
+            "x-stainless-package-version",
+            "x-stainless-os",
+            "x-stainless-arch",
+            "x-stainless-runtime",
+            "x-stainless-runtime-version",
+            "x-stainless-retry-count",
+            "x-stainless-timeout",
+        ];
+        provider.client_headers = source_only_headers
+            .iter()
+            .chain(sdk_headers.iter())
+            .map(|name| ((*name).into(), "client-injected".into()))
+            .chain([
+                ("X-Userinfo".into(), "client-injected-userinfo".into()),
+                ("X-Private-Data".into(), "true".into()),
+                ("X-Agent-Type".into(), "team".into()),
+                ("X-Agent-Intent".into(), "client-injected-intent".into()),
+                ("X-Agent-Purpose".into(), "client-injected-purpose".into()),
+                ("X-Enterprise-Id".into(), "client-injected-tenant".into()),
+                ("X-Tenant-Id".into(), "client-injected-tenant".into()),
+            ])
+            .collect();
+        for enterprise in [true, false] {
+            if !enterprise {
+                provider.credentials.remove("enterprise_id");
+            }
+            let answer = if enterprise {
+                "企业回答"
+            } else {
+                "个人回答"
+            };
+            local.reply(Reply::stream(&completion_stream("test-model", answer)));
+            let output = run(
+                &runtime,
+                &plugin,
+                region,
+                OperationInput::Infer {
+                    provider: provider.clone(),
+                    request: request(),
+                },
+                local.scope(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                response_wire(output)["choices"][0]["message"]["content"],
+                answer
+            );
+            let requests = local.requests.lock();
+            let wire = requests.last().unwrap();
+            assert_eq!(request_header(wire, "x-private-data"), Some("false"));
+            assert_eq!(request_header(wire, "x-stainless-os"), Some("Windows"));
+            assert_eq!(request_header(wire, "x-stainless-arch"), Some("x64"));
+            for name in sdk_headers {
+                assert_ne!(
+                    request_header(wire, name),
+                    Some("client-injected"),
+                    "client input cannot override the fixed SDK profile"
+                );
+                assert_eq!(
+                    wire.headers
+                        .iter()
+                        .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                        .count(),
+                    1,
+                    "a spoofed SDK header must not coexist with the fixed profile"
+                );
+            }
+            for (name, spoofed) in [
+                ("x-agent-type", "team"),
+                ("x-agent-intent", "client-injected-intent"),
+                ("x-agent-purpose", "client-injected-purpose"),
+            ] {
+                let actual = request_header(wire, name).expect("ordinary chat profile is present");
+                assert_ne!(
+                    actual, spoofed,
+                    "client headers cannot select an agent profile"
+                );
+            }
+            for name in source_only_headers {
+                assert!(
+                    request_header(wire, name).is_none(),
+                    "{name} cannot be created without an authentic source"
+                );
+            }
+            if enterprise {
+                let encoded = request_header(wire, "x-userinfo").unwrap();
+                let decoded: Value =
+                    serde_json::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
+                assert_eq!(
+                    decoded,
+                    json!({"uin":"identity-account","owner_uin":tenant})
+                );
+                assert_eq!(
+                    request_header(wire, "x-enterprise-id"),
+                    Some(tenant.as_str())
+                );
+                assert_eq!(request_header(wire, "x-tenant-id"), Some(tenant.as_str()));
+                assert_eq!(
+                    wire.headers
+                        .iter()
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("x-userinfo"))
+                        .count(),
+                    1,
+                    "a spoofed identity must not survive alongside the real identity"
+                );
+            } else {
+                for name in ["x-userinfo", "x-enterprise-id", "x-tenant-id"] {
+                    assert!(
+                        request_header(wire, name).is_none(),
+                        "personal requests must not retain or accept enterprise identity"
+                    );
+                }
+            }
+        }
+        let before = local.requests.lock().len();
+        provider
+            .credentials
+            .insert("enterprise_id".into(), json!("tenant\r\nx-injected: yes"));
+        assert!(
+            run(
+                &runtime,
+                &plugin,
+                region,
+                OperationInput::Infer {
+                    provider,
+                    request: request(),
+                },
+                local.scope(),
+            )
+            .await
+            .is_err(),
+            "an invalid enterprise header value must be rejected before HTTP"
+        );
+        assert_eq!(local.requests.lock().len(), before);
+        assert!(local.replies.lock().is_empty());
+    }
 }
 
 fn paid_provider() -> ProviderSnapshot {
@@ -1185,7 +1433,7 @@ fn requested_models(local: &LocalUpstream) -> Vec<String> {
         .iter()
         .filter(|request| request.method == "POST" && request.url.ends_with("/v2/chat/completions"))
         .map(|request| {
-            let body = decoded_request_body(request);
+            let body = application_request_body(request);
             let model = body["model"].as_str().unwrap();
             model.to_owned()
         })
@@ -1297,11 +1545,16 @@ async fn request_context_survives_retry_and_separates_model_calls() {
     let child = &requests[2];
     let next = &requests[3];
     assert_eq!(
-        decoded_request_body(first)["messages"],
-        decoded_request_body(retry)["messages"]
+        application_request_body(first)["messages"],
+        application_request_body(retry)["messages"]
     );
     for wire in requests.iter() {
-        assert_eq!(request_header(wire, "content-encoding"), Some("gzip"));
+        assert_chat_compression(wire, true);
+        assert_eq!(
+            request_header(wire, "x-stainless-retry-count"),
+            Some("0"),
+            "paid routing and separate model calls are not SDK transport retries"
+        );
         assert_eq!(request_header(wire, "x-product"), Some("SaaS"));
         assert!(
             request_header(wire, "acp-connection-id").is_none(),
@@ -1457,7 +1710,8 @@ async fn automatic_paid_line_switch_and_window_contract() {
         );
         assert_eq!(requested_models(&local), ["hy3", "hy3-x"]);
         for attempt in local.requests.lock().iter() {
-            let body = decoded_request_body(attempt);
+            assert_chat_compression(attempt, true);
+            let body = application_request_body(attempt);
             assert!(
                 body.get("x_client_only").is_none(),
                 "both free and paid attempts must filter unknown fields"

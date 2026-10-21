@@ -24,7 +24,6 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rust_decimal = { version = "1.43", default-features = false, features = ["std"] }
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
 opentelemetry-propagator-b3 = "0.33"

@@ -4,3 +4,5 @@ WorkBuddy Vendor Plugin
 上游服务、产品名称及商标归各自权利人所有。
 
 assets/workbuddy.svg 来源：https://download.codebuddy.ai/web/workbuddy/f5bce0c03cdc17fa28d25634fb48d2791c297da3/assets/logo.svg。保留官方 mascot 路径和双眼几何，移除背景、渐变及模糊并转换为透明单色，以适配界面主题。该品牌标志不属于本项目 MIT 授权范围；公开可下载不代表获得使用或再分发许可。WorkBuddy 服务协议第 9.3 条要求使用腾讯品牌特征及标志前取得书面同意，分发前须落实权利人许可：https://www.workbuddy.ai/document/term。
+
+.agents/skills/reverse-engineer-anything/ 中的技能与参考资料来自 morluto/rea 的 rea-agents 6.7.0 npm 发行包，采用 MIT License，Copyright (c) 2026 morluto。完整许可保留于该目录的 LICENSE。REA 仅作为开发工具使用，不链接到 Wasm 插件。

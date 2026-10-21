@@ -40,6 +40,19 @@ const MAX_AUTH_BODY: usize = 256 * 1024;
 /// 私有状态结构版本。
 const STATE_VERSION: u32 = 1;
 
+// 固定 Windows/x64 兼容 profile，不检测 Wasm 宿主；SDK 6.25.0、Electron 37.10.3 的 Node 22.21.1。
+const INFERENCE_SDK_HEADERS: [(&str, &str); 8] = [
+    ("X-Stainless-Lang", "js"),
+    ("X-Stainless-Package-Version", "6.25.0"),
+    ("X-Stainless-OS", "Windows"),
+    ("X-Stainless-Arch", "x64"),
+    ("X-Stainless-Runtime", "node"),
+    ("X-Stainless-Runtime-Version", "v22.21.1"),
+    // 免费→付费是新的模型请求，不是 SDK 网络重试。
+    ("X-Stainless-Retry-Count", "0"),
+    ("X-Stainless-Timeout", "600"),
+];
+
 /// 写入宿主私有状态的待登录会话。
 #[derive(Debug, Serialize, Deserialize)]
 struct PendingLogin {
@@ -269,7 +282,7 @@ pub(crate) fn headers(
     provider: &ProviderSnapshot,
     region: Region,
 ) -> Result<Vec<(String, String)>, PluginError> {
-    let mut headers = inference_headers(provider, region)?;
+    let mut headers = base_headers(provider, region, stored_credentials(provider, region)?)?;
     headers.extend([
         (
             "Accept".to_owned(),
@@ -297,6 +310,64 @@ pub(crate) fn inference_headers(
     region: Region,
 ) -> Result<Vec<(String, String)>, PluginError> {
     let stored = stored_credentials(provider, region)?;
+    let userinfo = if let Some(enterprise_id) = stored.enterprise_id.as_deref() {
+        #[derive(Serialize)]
+        struct UserInfo<'a> {
+            uin: &'a str,
+            owner_uin: &'a str,
+        }
+        let json = serde_json::to_vec(&UserInfo {
+            uin: &stored.uid,
+            owner_uin: enterprise_id,
+        })
+        .map_err(|_| malformed("could not encode WorkBuddy user info"))?;
+        Some(base64::engine::general_purpose::STANDARD.encode(json))
+    } else {
+        // 个人账号缺少官方要求的其他身份来源，不虚构 userinfo。
+        None
+    };
+    let mut headers = base_headers(provider, region, stored)?;
+    headers.extend(
+        INFERENCE_SDK_HEADERS
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
+    );
+    // 仅实现官方普通聊天缺省，不推断宿主内部 Agent 类型。
+    headers.extend([
+        ("X-Agent-Purpose".to_owned(), "conversation".to_owned()),
+        ("X-Agent-Intent".to_owned(), "craft".to_owned()),
+        ("X-Agent-Type".to_owned(), "main".to_owned()),
+    ]);
+    if let Some(userinfo) = userinfo {
+        headers.push(("X-Userinfo".to_owned(), userinfo));
+    }
+    let disable_optimization = provider
+        .model_metadata
+        .as_ref()
+        .and_then(|metadata| {
+            metadata
+                .extensions
+                .get("workbuddy_disable_model_optimization")
+        })
+        .and_then(Value::as_bool)
+        == Some(true);
+    headers.push((
+        "X-Private-Data".to_owned(),
+        if disable_optimization {
+            "true"
+        } else {
+            "false"
+        }
+        .to_owned(),
+    ));
+    Ok(headers)
+}
+
+fn base_headers(
+    provider: &ProviderSnapshot,
+    region: Region,
+    stored: StoredCredentials,
+) -> Result<Vec<(String, String)>, PluginError> {
     let access_token = stored
         .access_token
         .ok_or_else(|| auth_error("WorkBuddy access token is missing"))?;
@@ -311,7 +382,6 @@ pub(crate) fn inference_headers(
         ("Content-Type".to_owned(), "application/json".to_owned()),
         ("X-Requested-With".to_owned(), "XMLHttpRequest".to_owned()),
         // 保持 WorkBuddy 身份与区域，不接收客户端自报身份。
-        ("X-Agent-Purpose".to_owned(), "conversation".to_owned()),
         ("X-IDE-Name".to_owned(), "WorkBuddy".to_owned()),
         ("X-IDE-Type".to_owned(), "WorkBuddy".to_owned()),
         ("X-IDE-Version".to_owned(), region.version().to_owned()),

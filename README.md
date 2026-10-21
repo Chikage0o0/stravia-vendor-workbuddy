@@ -76,10 +76,13 @@ API Key:  由 Stravia 访问控制配置决定
 
 例如，`metadata`、`service_tier`、`user`、`seed`、`n`、`logit_bias`、`logprobs`、`top_logprobs` 和未知字段不会上送。现有 `max_completion_tokens` → `max_tokens`、`reasoningEffort` → `reasoning_effort` 等归一化仍先执行；允许字段不表示每次必发，实际值仍受共享 codec、宿主目标思考控制及现有模型归一化约束。
 
-请求头仅由插件的区域凭据、官方产品配置和宿主可信请求上下文生成，不转发客户端或 codec 自带的请求头。最终允许：
+请求头仅由插件的区域凭据、官方产品配置、固定 Windows/x64 兼容 profile 和宿主可信请求上下文生成，不转发客户端或 codec 自带的请求头。最终允许：
 
-- 传输：`Content-Type`、可选 `Content-Encoding: gzip`、`Accept`、`Authorization`、`User-Agent`、`X-Requested-With`；聊天 `Accept` 使用官方 SDK 的 `application/json`，请求体仍强制流式。
-- 身份：`X-Agent-Purpose`、`X-IDE-Name`、`X-IDE-Type`、`X-IDE-Version`、`X-Product`、`X-Domain`、`X-User-Id`、可选 `X-Enterprise-Id` / `X-Tenant-Id`。
+- 传输：`Content-Type`、`Accept`、`Authorization`、`User-Agent`、`X-Requested-With`；聊天 `Accept` 使用官方 SDK 的 `application/json`，请求体仍强制流式。插件不设置 `Accept-Encoding`、`Content-Encoding` 或 `Content-Length`，压缩相关头和实际长度由宿主 HTTP 传输层管理。
+- SDK 标记：下文固定 profile 列出的八项 `X-Stainless-*` 字段；按完整名称放行，不开放前缀透传。
+- 身份：`X-IDE-Name`、`X-IDE-Type`、`X-IDE-Version`、`X-Product`、`X-Domain`、`X-User-Id`、可选 `X-Enterprise-Id` / `X-Tenant-Id` / `X-Userinfo`。
+- Agent：普通聊天采用官方缺省 `X-Agent-Purpose: conversation`、`X-Agent-Intent: craft`、`X-Agent-Type: main`；只用于聊天，不带入模型发现或额度请求。这是插件当前的普通聊天配置，不表示识别了 Stravia 内部的子 Agent、团队或辅助调用。
+- 隐私标记：`X-Private-Data` 根据官方模型优化开关生成，不接受客户端请求头覆盖。
 - 会话：`X-Request-ID`、`X-Root-Request-ID`、`X-Conversation-ID`、`X-Conversation-Message-ID`、`X-Conversation-Request-ID`；真实 ACP 上下文存在时允许 `acp-connection-id`。
 - 追踪：`baggage`、`traceparent`、可选 `tracestate`、`b3`、`X-Trace-ID`、`X-B3-TraceId`、`X-B3-SpanId`、可选 `X-B3-ParentSpanId`、`X-B3-Sampled`。
 
@@ -95,6 +98,33 @@ API Key:  由 Stravia 访问控制配置决定
 
 当前客户端身份按区域的官方稳定更新 API 与实际桌面发布包核实：国内 WorkBuddy `5.8.3`、国际 WorkBuddy AI `5.8.4`，两者内嵌 CLI 均为 `2.161.0`。产品版本同步用于 `X-IDE-Version` 和 User-Agent。来源：[国内更新 API](https://www.workbuddy.cn/v2/update?platform=workbuddy-darwin-arm64)、[国际更新 API](https://www.workbuddy.ai/v2/update?platform=workbuddy-darwin-arm64)。独立 npm CLI 的 latest 版本不是桌面应用的内嵌 CLI，不能直接替代其身份字段；上面的白名单引用仍保留其原始核对版本。
 
+### 聊天请求头生成规则
+
+企业账号在现有凭据校验通过后，生成标准 Base64 编码的 `X-Userinfo`，内容为 `{"uin":"<uid>","owner_uin":"<enterprise_id>"}`。个人账号仅有 uid、没有其他真实身份来源时不生成该头；不从客户端头或任意 metadata 推断 `X-Auth-Method`、`X-Id-Source`。模型发现和额度请求不带聊天专用的 userinfo、隐私标记或 Agent 字段。
+
+模型发现仅在官方配置 `productFeatures.DisableYuanbaoChannel` 是布尔值时，将其保存为模型 metadata 扩展 `workbuddy_disable_model_optimization`。聊天中该扩展严格为 `true` 时发送 `X-Private-Data: true`，缺失、`false` 或类型不正确时均发送官方缺省 `false`。免费与付费线路使用同一产品配置快照，`paidMetadata` 不能改变此开关。
+
+当前宿主没有提供可信的子 Agent / 团队 / 辅助调用类型、原始父会话 ID 或上下文压缩状态，因此不生成相应的条件头，也不把传输亲和键当作父会话 ID。已核对的官方聊天链没有默认注入设备票据，故不增加 `X-Device-Token`。
+
+### 固定 Windows x64 SDK profile
+
+聊天请求按指定的 Windows x64 环境发送下列固定兼容头；认证、模型发现和额度请求不添加这一组，客户端请求头和 operation metadata 不能覆盖其值，也不放行任意 `X-Stainless-*` 字段。
+
+| 请求头 | 固定值 |
+|--------|--------|
+| `X-Stainless-Lang` | `js` |
+| `X-Stainless-Package-Version` | `6.25.0` |
+| `X-Stainless-OS` | `Windows` |
+| `X-Stainless-Arch` | `x64` |
+| `X-Stainless-Runtime` | `node` |
+| `X-Stainless-Runtime-Version` | `v22.21.1` |
+| `X-Stainless-Retry-Count` | `0` |
+| `X-Stainless-Timeout` | `600` |
+
+SDK 版本与默认 timeout 取自上述官方 npm bundle；`DEFAULT_TIMEOUT=600000` 毫秒经秒级转换得到 timeout 头。免费→付费切换是新的模型请求，不属于 SDK 网络重试，两次均从零开始；本次不新增网络重试，也不改变宿主实际请求期限。
+
+Node 版本选择已安装 WorkBuddy 所用 Electron `37.10.3` 对应的 Node `22.21.1`，来源为 [Electron 官方发布记录](https://releases.electronjs.org/release/v37.10.3)。这是固定兼容 profile，不是对 Wasm 宿主的运行时检测；现有静态证据也不足以证明所有官方聊天 CLI 路径都使用此 Node 版本。SDK 版本与 Node 版本分别来自 npm bundle 和 Electron 发布记录，不能混同于桌面产品版本或内嵌 CLI 版本。
+
 ### 请求上下文与 gzip
 
 - `X-Product` 使用模型发现保存的官方 `deploymentType`，缺失时默认 `SaaS`，不接受客户端覆盖。`deploymentType` 和 `productFeatures.RequestBodyGzip` 分别保存到现有模型元数据扩展 `workbuddy_deployment_type`、`workbuddy_request_body_gzip`；免费／付费线路共用当前操作的产品配置快照。更新后需重新同步模型；手动模型 ID 未读取产品配置时使用产品默认值。
@@ -102,9 +132,9 @@ API Key:  由 Stravia 访问控制配置决定
 - 宿主每个运行保存独立、未采样的 W3C 根传播上下文，经可信 `operation_metadata.traceparent` 传给插件；有效 `tracestate` 一同继承。插件为每次模型操作新建模型 span，内部免费→付费重试复用该 span，每个 HTTP 尝试另建子 span。B3 单头／多头表示模型 span，W3C 表示 HTTP span，采样位继承父上下文；WorkBuddy 的 B3 parent 扩展单独补充。宿主上下文缺失或无效时告警并新建推理级未采样 trace，不启动遥测导出，也不宣称完整复刻官方遥测。
 - `X-Request-ID` 与 `X-Conversation-Message-ID` 每次 HTTP 尝试共用一枚新 ID；`X-Conversation-Request-ID` 在同一次模型操作内稳定。`baggage` 使用真正的 conversation-request ID，而不是每次尝试的 message ID。`X-Conversation-ID` 仍只来自宿主会话亲和键。
 - ACP 头只接受宿主从真实 ACP 连接取得的 `operation_metadata.acp_connection_id`。当前直连宿主没有 ACP 连接生产者，因此省略并记宿主诊断；不生成随机连接 ID，不挪用 OAuth 连接 ID、传输亲和键或云任务连接 ID，本次不新增 ACP 通道。
-- 仅聊天 POST 的最终 JSON 字节使用纯 Rust `flate2` 压缩，以二进制发送并附带 `Content-Encoding: gzip`，不是 Base64。默认启用；官方配置明确为 `false` 时发送原 JSON。压缩失败记录宿主告警并回退原 JSON，不保留 gzip 头。认证、配置 GET 和额度 POST 不压缩，长度由宿主按实际字节计算。
+- 仅聊天 POST 通过 SDK 的 `GuestHost::http_start_with_compression(HttpRequest, HttpCompression)` 请求宿主压缩。Guest 始终传递原始 `application/json` 字节，不自行 gzip 或 Base64 编码；`HttpCompression.request` 默认选择 `Gzip`，官方元数据 `workbuddy_request_body_gzip` 明确为 `false` 时设为 `None`，不压缩请求。宿主负责 gzip、实际字节长度及相关传输头。响应 coding 列表保持为空（identity），本次不扩展上游响应压缩协商。认证、配置 GET 和额度 POST 不请求压缩。SDK / 宿主返回错误时按原错误处理，不回退或重新发送裸 JSON 请求。
 
-跨重试／子调用的宿主根上下文需要同步构建本次 Stravia 宿主的 `RunObserver` 与 `model_turn::prepare_attempt` 修改；只导入新 Wasm 不能让旧宿主自动产生这些元数据。沿用现有 SDK `0.4.0` 的通用元数据与二进制 body 接口，不增加 WIT 字段或持久化 schema。
+跨重试／子调用的宿主根上下文需要同步构建 Stravia 宿主的 `RunObserver` 与 `model_turn::prepare_attempt` 修改；只导入新 Wasm 不能让旧宿主自动产生这些元数据。本次升级使用下述固定提交的 SDK 与 WIT `stravia:vendor@0.5.1` 新增 HTTP compression API；canonical format 仍为 `1`，不新增持久化 schema。必须先升级到支持该 API 的宿主，再重新构建并导入插件；旧宿主不能只靠重新导入插件获得新 API。
 
 `x-device-token` 尚未实现。当前 `wasm32-wasip2` 不能直接加载官方客户端的 N-API `.node`；已核实的包装层仅尝试 Windows/macOS，不能据此承诺 Linux、CPU 架构或独立分发支持。推荐取得合法独立 SDK、WorkBuddy 认可的 channel 配置与平台支持后，在可信原生宿主的受限 HTTP 出口生成并注入，令牌不进入 Wasm 或声明为 non-secret 的 `operation_metadata`。腾讯公开 [SDK 平台资料](https://main.qcloudimg.com/raw/document/product/pdf/1628_111422_cn.pdf) 包含 Web/H5，但没有证明其票据兼容 WorkBuddy；[服务端风险 API](https://main.qcloudimg.com/raw/document/product/pdf/1628_79611_cn.pdf) 消费客户端票据，不能当作替代签发接口。本次没有执行设备 SDK 或发送设备信息。
 
@@ -141,11 +171,11 @@ API Key:  由 Stravia 访问控制配置决定
 
 ## 自行构建
 
-当前源码使用插件目录旁的完整 `StraviaPlatform/` checkout，五个 Stravia 依赖统一指向 `../StraviaPlatform/backend/crates/...`；不能只下载本插件源码。发布工作流按同一目录关系检出到 `source/StraviaPlatform`；`STRAVIA_PLATFORM_REF` 仓库变量可指定 revision，默认固定 dev 提交 `7fac0bc5af644ae13c389b219700a9c4359181af`，SDK 版本仍为 `0.4.0`。本地 checkout 应使用同一提交。覆盖该变量前须核对 SDK、protocol-codec 和 vendor-runtime 契约，并通过构建与真实组件验证。
+当前源码使用插件目录旁的完整 `StraviaPlatform/` checkout，五个 Stravia 依赖统一指向 `../StraviaPlatform/backend/crates/...`；不能只下载本插件源码。发布工作流按同一目录关系检出到 `source/StraviaPlatform`；`STRAVIA_PLATFORM_REF` 仓库变量可指定 revision，默认固定 dev 提交 [`20c1291c142d5c19ba267552a6bfbdbb1c947bc6`](https://github.com/Stravia-AI/StraviaPlatform/commit/20c1291c142d5c19ba267552a6bfbdbb1c947bc6)。该提交的 [workspace Cargo.toml](https://github.com/Stravia-AI/StraviaPlatform/blob/20c1291c142d5c19ba267552a6bfbdbb1c947bc6/Cargo.toml) 声明 Rust workspace crate 版本为 `0.5.2`；这与 WIT ABI 包版本 `stravia:vendor@0.5.1` 是两套版本号，不能把 ABI 版本当作 SDK crate 版本。本地 checkout 应使用同一提交，不以旧本地 checkout 代替远端固定版本。覆盖该变量前须核对 SDK、protocol-codec 和 vendor-runtime 契约，并通过构建与真实组件验证。
 
 `assets/workbuddy.svg` 使用 [WorkBuddy 官方 SVG](https://download.codebuddy.ai/web/workbuddy/f5bce0c03cdc17fa28d25634fb48d2791c297da3/assets/logo.svg) 的原始 mascot 和双眼几何，去掉背景、渐变及模糊，编译进 Wasm 为透明单色图标。显示需要更新后的 Stravia 宿主并重新导入插件，不在运行时下载品牌资源。图标归属和使用限制见 [NOTICE](NOTICE)。
 
-依赖：Rust `1.99.0`（`rust-toolchain.toml` 已锁定，与上游最低版本一致）+ `wasm32-wasip2` target；可选安装 [Task](https://taskfile.dev)。若环境变量 `RUSTUP_TOOLCHAIN` 覆盖了项目工具链，须清除覆盖或在下列命令中使用 `cargo +1.99.0`。
+依赖：Rust `1.99.1`（`rust-toolchain.toml` 已锁定；固定上游提交声明的最低版本为 `1.99.0`）+ `wasm32-wasip2` target；可选安装 [Task](https://taskfile.dev)。若环境变量 `RUSTUP_TOOLCHAIN` 覆盖了项目工具链，须清除覆盖或在下列命令中使用 `cargo +1.99.1`。
 
 ```bash
 # 仅构建组件
@@ -159,12 +189,27 @@ task dist
 task test
 ```
 
+## REA 逆向分析工具（开发用途）
+
+项目根目录的 `.mcp.json` 为 Windows 下的 OMP 注册了 [REA](https://github.com/morluto/rea) MCP 服务，通过 `npx` 运行固定版本，不修改用户全局代理配置。需要符合 [REA 运行要求](https://github.com/morluto/rea/blob/main/docs/installation.md) 的 Node.js 与 npm；Rust 构建和 Wasm 插件不依赖此工具。
+
+`.agents/skills/reverse-engineer-anything/` 包含该 npm 发行包配套的技能与参考资料。安装后重启当前项目的 OMP 会话，使其发现 MCP 服务和技能。CLI 也可直接使用：
+
+```powershell
+npx --yes --ignore-scripts rea-agents@6.7.0 --help
+```
+
+启动配置使用 `--ignore-scripts`，避免可选 Frida 依赖的原生安装脚本阻塞下载。Frida 原生绑定不在本次安装范围内；需要动态插桩时须单独完成安装。原生反编译还需自行配置 Ghidra 或 IDA 等分析引擎；注册 MCP 不代表所有分析后端均已就绪。
+
 ## 未发布：请求传输与上下文对齐
 
 - 补充轮次 root、B3 单头及 parent 扩展，按模型／HTTP 分层传播 W3C 上下文；ACP 按真实连接来源处理，缺失不伪造。
-- 产品身份取官方配置或默认 `SaaS`；聊天请求启用真实 gzip 字节，尊重官方显式关闭。
-- 固定 Stravia revision、SDK `0.4.0` 与 Rust `1.99.0` 构建通过；30 项单元测试、9 项真实 Wasm 契约通过。独立程序经实际 loopback TCP HTTP 完成国内 gzip 免费→付费重试与国际显式关闭 gzip，Node 解压并核对 Unicode、root／span 生命周期和产品头。使用合成凭据，没有调用真实上游或消耗账号积分。
-- 宿主运行上下文跨子执行继承的定向回归通过；同一组件也在当前相邻 Stravia 的运行时完成上述独立 TCP 冒烟。需同步构建宿主修改才能获得跨模型调用的根关联。设备令牌仅完成方案调查，不包含原生 SDK 集成。
+- 产品身份取官方配置或默认 `SaaS`；聊天通过宿主 HTTP compression API 请求 gzip，Guest 只传原始 JSON，尊重官方显式关闭；传输头与长度由宿主管理，错误不触发裸请求重发。
+- 固定远端 Stravia dev 提交 `20c1291c142d5c19ba267552a6bfbdbb1c947bc6`，Rust workspace SDK crate 版本为 `0.5.2`、WIT ABI 为 `0.5.1`，构建工具链更新为 Rust `1.99.1`；canonical format 保持 `1`。须升级支持新 API 的宿主后重新构建并导入组件。
+- 聊天按真实账号条件生成企业 `X-Userinfo`，按产品配置生成 `X-Private-Data`，并补齐普通聊天 Agent 缺省；这些字段不进入发现或额度请求。保留请求上下文与重试生命周期，不接受客户端伪造身份，也不虚构缺少来源的 Agent、父会话或上下文压缩状态。
+- 聊天补齐上述八项固定 Windows/x64 SDK 兼容头；客户端和 operation metadata 无法覆盖，不放行未知 Stainless 字段或 helper/poll 头。免费与付费线路都以新的 SDK 请求计数，不改变宿主超时及压缩行为。
+- 本轮请求头对齐使用上述固定 SDK 和 Rust `1.99.1` 完成 release Wasm 构建，通过 30 项单元测试与 10 项真实 Wasm 组件契约。独立 TCP 冒烟加载同一组件，4 个场景、5 次真实 loopback 交换验证了企业／个人身份、隐私开关缺失和错误类型、客户端及 metadata 伪造过滤、八项固定 SDK 头唯一且无额外字段、免费／付费计数均为零，以及 Agent 普通缺省和请求与 trace 生命周期。此次头部冒烟显式关闭 gzip，仅使用合成凭据与本地服务，未调用真实上游。
+- SDK 迁移时另行验证的 loopback TCP 冒烟使用上游未修改的生产 HTTP 编码器：国内免费／付费请求均为单层 gzip，国际显式关闭后为原始 JSON；Unicode、产品快照、root/message 关联和单次 `UpstreamStarted` 均通过。宿主运行上下文的跨子执行根关联仍需同步构建宿主修改；设备令牌不包含原生 SDK 集成。
 
 ## v0.2.2 升级说明
 

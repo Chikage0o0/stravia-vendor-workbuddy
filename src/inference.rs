@@ -7,9 +7,7 @@
 //! 再交给共享流解码器逐事件解出 canonical 增量。
 
 use std::borrow::Cow;
-use std::io::Write;
 
-use flate2::{Compression, write::GzEncoder};
 use serde_json::{Value, json};
 use stravia_protocol_codec::accumulator::StreamResponseAccumulator;
 use stravia_protocol_codec::transform::{ProtocolTransform, StreamDecodeStage};
@@ -17,8 +15,9 @@ use stravia_runtime_contract::protocol::ids::ProtocolEndpoint;
 use stravia_runtime_contract::protocol::ir::AiRequest;
 use stravia_vendor_common::common;
 use stravia_vendor_sdk::{
-    AiErrorKind, AiStreamDelta, ErrorKind, GuestHost, HttpRequest, HttpResponse, LogLevel,
-    ModelMetadata, OperationOutput, PluginError, ProviderSnapshot, read_http_body,
+    AiErrorKind, AiStreamDelta, ErrorKind, GuestHost, HttpCompression, HttpContentCoding,
+    HttpRequest, HttpResponse, ModelMetadata, OperationOutput, PluginError, ProviderSnapshot,
+    read_http_body,
 };
 
 use crate::{PROTOCOL, Region, auth, request_context::RequestContext};
@@ -156,8 +155,6 @@ pub(crate) fn execute(
                 format!("failed to serialize request body: {error}"),
             )
         })?;
-        // deploymentType 与压缩开关属于产品配置快照，不随免费/付费模型切换。
-        let (body, compressed) = encode_chat_body(host, body, provider.model_metadata.as_ref());
         // 上游身份与会话头只由插件构造，不接收 codec 或客户端自带的标头。
         let mut headers = match first_auth_headers.take() {
             Some(headers) => headers,
@@ -165,19 +162,19 @@ pub(crate) fn execute(
         };
         set_header(&mut headers, "accept", "application/json");
         context.apply(&mut headers);
-        if compressed {
-            set_header(&mut headers, "content-encoding", "gzip");
-        }
         retain_cli_headers(&mut headers);
         if attempt == 0 {
             host.emit_started()?;
         }
-        let response = host.http_start(HttpRequest {
-            method: "POST".into(),
-            url: format!("{}{CHAT_PATH}", region.origin()),
-            headers,
-            body,
-        })?;
+        let response = host.http_start_with_compression(
+            HttpRequest {
+                method: "POST".into(),
+                url: format!("{}{CHAT_PATH}", region.origin()),
+                headers,
+                body,
+            },
+            chat_compression(provider.model_metadata.as_ref()),
+        )?;
         let mut rate_limit = None;
         let mut deferred_deltas = Vec::new();
         let result = decode_attempt(
@@ -352,30 +349,15 @@ fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
     headers.push((name.to_owned(), value.to_owned()));
 }
 
-/// 桌面产品默认启用 gzip；官方配置显式关闭时按原 JSON 发送。
-fn encode_chat_body(
-    host: &GuestHost,
-    body: Vec<u8>,
-    metadata: Option<&ModelMetadata>,
-) -> (Vec<u8>, bool) {
-    if metadata
+/// 压缩属于产品配置快照，不随免费/付费模型切换；编码和传输头由宿主独占。
+fn chat_compression(metadata: Option<&ModelMetadata>) -> HttpCompression {
+    let gzip = metadata
         .and_then(|metadata| metadata.extensions.get("workbuddy_request_body_gzip"))
         .and_then(Value::as_bool)
-        == Some(false)
-    {
-        return (body, false);
-    }
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    let compressed = encoder.write_all(&body).and_then(|()| encoder.finish());
-    match compressed {
-        Ok(compressed) => (compressed, true),
-        Err(_) => {
-            host.log(
-                LogLevel::Warn,
-                "WorkBuddy chat gzip compression failed; sending uncompressed JSON",
-            );
-            (body, false)
-        }
+        != Some(false);
+    HttpCompression {
+        request: gzip.then_some(HttpContentCoding::Gzip),
+        response: Vec::new(),
     }
 }
 
@@ -384,12 +366,23 @@ fn encode_chat_body(
 fn retain_cli_headers(headers: &mut Vec<(String, String)>) {
     const ALLOWED: &[&str] = &[
         "content-type",
-        "content-encoding",
         "accept",
         "authorization",
         "user-agent",
+        "x-stainless-lang",
+        "x-stainless-package-version",
+        "x-stainless-os",
+        "x-stainless-arch",
+        "x-stainless-runtime",
+        "x-stainless-runtime-version",
+        "x-stainless-retry-count",
+        "x-stainless-timeout",
         "x-requested-with",
         "x-agent-purpose",
+        "x-agent-intent",
+        "x-agent-type",
+        "x-private-data",
+        "x-userinfo",
         "x-ide-name",
         "x-ide-type",
         "x-ide-version",
