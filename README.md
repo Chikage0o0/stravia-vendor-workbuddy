@@ -201,8 +201,11 @@ npx --yes --ignore-scripts rea-agents@6.7.0 --help
 
 启动配置使用 `--ignore-scripts`，避免可选 Frida 依赖的原生安装脚本阻塞下载。Frida 原生绑定不在本次安装范围内；需要动态插桩时须单独完成安装。原生反编译还需自行配置 Ghidra 或 IDA 等分析引擎；注册 MCP 不代表所有分析后端均已就绪。
 
-## 未发布：请求传输与上下文对齐
+## v0.2.2 升级说明
 
+- **升级要求**：须先升级到支持新版 HTTP compression API 的 Stravia 宿主，再重新导入组件；国内连接的 base URL 使用 `https://www.workbuddy.cn`，升级后重新同步模型。
+- 认证、配置、聊天与积分查询切换为新版客户端接口和区域身份；保留区域凭据隔离，移除旧国内计费 origin，不提供旧地址回退。
+- 额度查询改为单次资源包汇总，保留精确的小数积分，拒绝不完整数据；不再依赖旧资源列表分页或套餐名称。
 - 补充轮次 root、B3 单头及 parent 扩展，按模型／HTTP 分层传播 W3C 上下文；ACP 按真实连接来源处理，缺失不伪造。
 - 产品身份取官方配置或默认 `SaaS`；聊天通过宿主 HTTP compression API 请求 gzip，Guest 只传原始 JSON，尊重官方显式关闭；传输头与长度由宿主管理，错误不触发裸请求重发。
 - 固定远端 Stravia dev 提交 `20c1291c142d5c19ba267552a6bfbdbb1c947bc6`，Rust workspace SDK crate 版本为 `0.5.2`、WIT ABI 为 `0.5.1`，构建工具链更新为 Rust `1.99.1`；canonical format 保持 `1`。须升级支持新 API 的宿主后重新构建并导入组件。
@@ -210,14 +213,6 @@ npx --yes --ignore-scripts rea-agents@6.7.0 --help
 - 聊天补齐上述八项固定 Windows/x64 SDK 兼容头；客户端和 operation metadata 无法覆盖，不放行未知 Stainless 字段或 helper/poll 头。免费与付费线路都以新的 SDK 请求计数，不改变宿主超时及压缩行为。
 - 本轮请求头对齐使用上述固定 SDK 和 Rust `1.99.1` 完成 release Wasm 构建，通过 30 项单元测试与 10 项真实 Wasm 组件契约。独立 TCP 冒烟加载同一组件，4 个场景、5 次真实 loopback 交换验证了企业／个人身份、隐私开关缺失和错误类型、客户端及 metadata 伪造过滤、八项固定 SDK 头唯一且无额外字段、免费／付费计数均为零，以及 Agent 普通缺省和请求与 trace 生命周期。此次头部冒烟显式关闭 gzip，仅使用合成凭据与本地服务，未调用真实上游。
 - SDK 迁移时另行验证的 loopback TCP 冒烟使用上游未修改的生产 HTTP 编码器：国内免费／付费请求均为单层 gzip，国际显式关闭后为原始 JSON；Unicode、产品快照、root/message 关联和单次 `UpstreamStarted` 均通过。宿主运行上下文的跨子执行根关联仍需同步构建宿主修改；设备令牌不包含原生 SDK 集成。
-
-## v0.2.2 升级说明
-
-- 认证、配置、聊天与积分查询切换为上述新版客户端接口和区域身份；保留区域凭据隔离，移除旧国内计费 origin，不提供旧地址回退。
-- 额度查询改为单次资源包汇总，保留精确的小数积分，拒绝不完整数据；不再依赖旧资源列表分页或套餐名称。
-- 使用项目固定的 Stravia revision 与 Rust `1.99.0` 构建，通过 34 项单元测试和 8 项 Wasm 组件契约。
-- 独立程序加载新组件，使用真实国内凭据完成新版模型发现、积分查询与 `hy3` 推理，三个接口均返回 HTTP 200。聊天返回 `text/event-stream`，最终文本为 `OK`，正常结束并返回 usage；自动付费保持关闭，未执行生图。国际版已核对官方发行包并通过组件契约，未使用国际账号实测。
-- SDK 仍为 `0.4.0`，本轮不迁移 Stravia SDK 或 canonical 请求契约。相邻 Stravia checkout 若不在项目指定 revision，应按上文构建基准准备独立源码，而不是直接更新依赖锁定。
 
 ## v0.2.1 升级说明
 
