@@ -14,7 +14,7 @@ use stravia_vendor_sdk::{
 
 use crate::{Region, auth, request_context::RequestContext};
 
-pub(crate) const IMAGE_CDN_HOST: &str = "ai-corpus-backup-1258344699.cos.ap-beijing.myqcloud.com";
+pub(crate) const IMAGE_CDN_HOST_REGEX: &str = r"[a-z0-9-]+\.cos\.[a-z0-9-]+\.myqcloud\.com";
 const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ENCODED_BYTES: usize = MAX_IMAGE_BYTES.div_ceil(3) * 4;
 const MAX_RESPONSE_BYTES: usize = MAX_ENCODED_BYTES + 2 * 1024 * 1024;
@@ -75,7 +75,7 @@ pub(crate) fn generate(
     drop(body);
     let (mut artifact, revised_prompt, raw_usage) = parse_response(payload)?;
     if let Some(url) = artifact.upstream_ref.take() {
-        let url = download_url(&url, region)?;
+        let url = download_url(&url)?;
         // COS 签名 URL 不属于账号 API；绝不复用 Authorization、账号或会话标头。
         let response = host.http_start(HttpRequest {
             method: "GET".into(),
@@ -251,7 +251,7 @@ fn parse_response(
     Ok((artifact, revised_prompt, data.remove("usage")))
 }
 
-fn download_url(value: &str, region: Region) -> Result<url::Url, PluginError> {
+fn download_url(value: &str) -> Result<url::Url, PluginError> {
     let url =
         url::Url::parse(value).map_err(|_| upstream("WorkBuddy returned an invalid image URL"))?;
     if url.scheme() != "https"
@@ -259,12 +259,12 @@ fn download_url(value: &str, region: Region) -> Result<url::Url, PluginError> {
         || !url.username().is_empty()
         || url.password().is_some()
         || url.fragment().is_some()
-        || !url
-            .host_str()
-            .is_some_and(|host| host == IMAGE_CDN_HOST || host == region.domain())
     {
-        return Err(upstream("WorkBuddy image URL is outside approved origins"));
+        return Err(upstream(
+            "WorkBuddy image URL requires HTTPS on port 443 without credentials or a fragment",
+        ));
     }
+    // 主机准入由宿主冻结的权限策略执行，不在插件中重复解析正则或从响应扩权。
     Ok(url)
 }
 
@@ -381,21 +381,21 @@ mod tests {
     }
 
     #[test]
-    fn image_urls_cannot_expand_network_or_cross_regions() {
+    fn image_urls_require_https_without_credentials_or_fragments() {
         for value in [
-            "http://ai-corpus-backup-1258344699.cos.ap-beijing.myqcloud.com/image.png",
-            "https://127.0.0.1/image.png",
-            "https://www.workbuddy.ai/image.png",
+            "http://images-1250000001.cos.ap-shanghai.myqcloud.com/image.png",
             "https://www.workbuddy.cn:444/image.png",
             "https://user:secret@www.workbuddy.cn/image.png",
-            "https://www.workbuddy.cn.evil.test/image.png",
             "https://www.workbuddy.cn/image.png#fragment",
         ] {
-            assert!(download_url(value, Region::Cn).is_err(), "{value}");
+            assert!(download_url(value).is_err(), "{value}");
         }
-        let url = format!("https://{IMAGE_CDN_HOST}/image.png?signature=synthetic");
-        assert_eq!(download_url(&url, Region::Cn).unwrap().as_str(), url);
-        assert!(download_url("https://www.workbuddy.ai/image.png", Region::Intl).is_ok());
+        for url in [
+            "https://images-1250000001.cos.ap-shanghai.myqcloud.com/image.png?signature=synthetic",
+            "https://images-1250000002.cos.ap-singapore.myqcloud.com/image.png?signature=synthetic",
+        ] {
+            assert_eq!(download_url(url).unwrap().as_str(), url);
+        }
     }
 
     #[test]

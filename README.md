@@ -66,9 +66,11 @@ API Key:  由 Stravia 访问控制配置决定
 | `9:16` | `576x1024` |
 | `16:9` | `1024x576` |
 
-仅接受成功响应中的单张图片；空结果、多图、业务错误及损坏的 Base64 均报错。`b64_json` 解码为图片字节；URL 产物只允许所选区域的 HTTPS origin，以及已核实的固定 HTTPS origin `https://ai-corpus-backup-1258344699.cos.ap-beijing.myqcloud.com`。不接受其他域名、跨区域 URL、嵌入式凭据或非标准端口，不从响应动态扩大网络权限。
+仅接受成功响应中的单张图片；空结果、多图、业务错误及损坏的 Base64 均报错。`b64_json` 解码为图片字节；URL 产物允许当前连接已批准的区域 HTTPS origin，以及静态声明的 COS 主机正则 `[a-z0-9-]+\.cos\.[a-z0-9-]+\.myqcloud\.com`。正则匹配完整规范化 DNS 主机名，不固定桶名或 COS 区域，也不扩大到任意 `myqcloud.com` 子域。域名、协议与端口的最终准入由宿主冻结的操作权限执行，不从响应动态扩权。
 
-产物 GET 只发送 `Accept: image/*`，不转发 WorkBuddy 的 Authorization、账号、企业或会话头。下载要求图片 MIME，图片字节上限为 32 MiB；签名 URL 不进入返回产物。实际图片格式与像素内容由 Core 统一解码校验。重新导入插件时，宿主会展示新增的精确 COS 出站权限；未来上游改用其他 CDN 时会明确失败，需重新核实并更新声明，不能扩大为通配域名。
+产物 GET 只发送 `Accept: image/*`，不转发 WorkBuddy 的 Authorization、账号、企业或会话头；URL 必须为 HTTPS／443，不能含嵌入式凭据或 fragment。下载要求图片 MIME，图片字节上限为 32 MiB；签名 URL 不进入返回产物。实际图片格式与像素内容由 Core 统一解码校验。重新导入时，支持正则的宿主会显示新增的主机正则、HTTPS 与有效端口 443，以及被移除的固定桶权限。COS 范围外的 CDN 仍会被拒绝，需要重新核实并更新声明，不开放任意响应 URL。
+
+该声明使用 `host: {"regex":"..."}`，需要同时更新 SDK 和 Stravia 宿主。新宿主继续加载旧插件的字符串 host，并保留其精确匹配语义；旧宿主会在加载新对象时明确拒绝，不能只更新插件。插件不重复实现宿主的正则匹配器。
 
 存在的 `input_tokens`、`output_tokens`、`total_tokens` 映射为 canonical token 用量；缺失 token 计量时不伪造零用量。上游原始图片计数和 `credit` 等计量保存在产物 `metadata.workbuddy_usage`，不把积分当作 token。图片生成可能消耗积分；`auto_paid_on_rate_limit` 只控制聊天线路，不作用于图片请求，图片请求没有自动付费切换或重试。
 
@@ -83,7 +85,7 @@ API Key:  由 Stravia 访问控制配置决定
 
 这证明国内账号的接口与产物格式，不承诺其他账号的权限、价格或模型尺寸。国际操作入口已实现，但当前实测账号没有可用生图模型；重新同步后只展示上游实际开放的模型。两区各只发起一次真实生图，没有自动重试。真实 API 核验使用直接请求，不等同于已在用户宿主中导入并完成线上端到端调用。
 
-本次 release Wasm 另通过 36 项单元测试、11 项真实组件契约，以及独立程序的 7 个场景、8 次真实 loopback TCP 交换。回放使用脱敏后的真实目录和国内生成的 PNG、合成凭据，验证两区发现、URL 下载、Base64 文生图、参考图、尺寸映射、上游错误不重试及未批准 URL 拒绝；不把国际离线成功响应当作线上出图成功。组件契约同时检查下载不泄露凭据和跨区域凭据在出站前被拒绝。
+已发布 v0.3.0 的 Wasm 另通过 36 项单元测试、11 项真实组件契约，以及独立程序的 7 个场景、8 次真实 loopback TCP 交换。回放使用脱敏后的真实目录和国内生成的 PNG、合成凭据，验证两区发现、URL 下载、Base64 文生图、参考图、尺寸映射、上游错误不重试及未批准 URL 拒绝；不把国际离线成功响应当作线上出图成功。组件契约同时检查下载不泄露凭据和跨区域凭据在出站前被拒绝。此次正则变更仅使用合成凭据、本地网络与隔离数据库验证，没有再次发起真实生图。
 
 ## 可选配置
 
@@ -216,7 +218,9 @@ Node 版本选择已安装 WorkBuddy 所用 Electron `37.10.3` 对应的 Node `2
 
 ## 自行构建
 
-当前源码使用插件目录旁的完整 `StraviaPlatform/` checkout，五个 Stravia 依赖统一指向 `../StraviaPlatform/backend/crates/...`；不能只下载本插件源码。发布工作流按同一目录关系检出到 `source/StraviaPlatform`；`STRAVIA_PLATFORM_REF` 仓库变量可指定 revision，默认固定 dev 提交 [`20c1291c142d5c19ba267552a6bfbdbb1c947bc6`](https://github.com/Stravia-AI/StraviaPlatform/commit/20c1291c142d5c19ba267552a6bfbdbb1c947bc6)。该提交的 [workspace Cargo.toml](https://github.com/Stravia-AI/StraviaPlatform/blob/20c1291c142d5c19ba267552a6bfbdbb1c947bc6/Cargo.toml) 声明 Rust workspace crate 版本为 `0.5.2`；这与 WIT ABI 包版本 `stravia:vendor@0.5.1` 是两套版本号，不能把 ABI 版本当作 SDK crate 版本。本地 checkout 应使用同一提交，不以旧本地 checkout 代替远端固定版本。覆盖该变量前须核对 SDK、protocol-codec 和 vendor-runtime 契约，并通过构建与真实组件验证。
+当前源码使用插件目录旁的完整 `StraviaPlatform/` checkout，五个 Stravia 依赖统一指向 `../StraviaPlatform/backend/crates/...`；不能只下载本插件源码。此未发布变更要求该 checkout 包含 SDK 的 `OriginHost` 和 Core 的主机正则权限实现，不能只按 crate 版本号判断兼容性。
+
+发布工作流按同一目录关系检出到 `source/StraviaPlatform`；现有 `STRAVIA_PLATFORM_REF` 仓库变量可指定固定 revision。工作流默认的 [`20c1291c142d5c19ba267552a6bfbdbb1c947bc6`](https://github.com/Stravia-AI/StraviaPlatform/commit/20c1291c142d5c19ba267552a6bfbdbb1c947bc6) 是已发布 v0.3.0 的依赖基线，不含此新契约；发布正则版本前，必须先合入宿主变更，再将该变量设为包含变更的固定提交。覆盖变量后须核对 SDK、protocol-codec 和 vendor-runtime 契约，并通过构建与真实组件验证。Rust workspace crate 版本与 WIT ABI 包版本是两套版本号，本次不改变 `stravia:vendor@0.5.1`。
 
 `assets/workbuddy.svg` 使用 [WorkBuddy 官方 SVG](https://download.codebuddy.ai/web/workbuddy/f5bce0c03cdc17fa28d25634fb48d2791c297da3/assets/logo.svg) 的原始 mascot 和双眼几何，去掉背景、渐变及模糊，编译进 Wasm 为透明单色图标。显示需要更新后的 Stravia 宿主并重新导入插件，不在运行时下载品牌资源。图标归属和使用限制见 [NOTICE](NOTICE)。
 
@@ -245,6 +249,12 @@ npx --yes --ignore-scripts rea-agents@6.7.0 --help
 ```
 
 启动配置使用 `--ignore-scripts`，避免可选 Frida 依赖的原生安装脚本阻塞下载。Frida 原生绑定不在本次安装范围内；需要动态插桩时须单独完成安装。原生反编译还需自行配置 Ghidra 或 IDA 等分析引擎；注册 MCP 不代表所有分析后端均已就绪。
+
+## 未发布变更
+
+- COS 图片下载权限由单一固定桶改为上述完整主机正则，支持不同桶和 COS 区域；HTTPS／443、默认拒绝及无凭据下载约束不变。
+- 需要先升级宿主，再使用支持该契约的 SDK 构建、导入插件。新宿主保留旧插件加载及精确授权语义；实物 v0.2.2、已发布 v0.3.0 已在隔离实例验证加载、安装与数据库重开。
+- 当前源码和本地构建与已发布 v0.3.0 的原始 artifact 不同；未重发或修改既有 release。
 
 ## v0.3.0 升级说明
 

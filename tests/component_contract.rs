@@ -93,11 +93,14 @@ impl LocalUpstream {
 #[async_trait]
 impl HostServices for LocalUpstream {
     fn http_start(&self, request: HttpRequest) -> Result<Arc<dyn HostHttpResponse>, HostFailure> {
-        let url = url::Url::parse(&request.url).unwrap();
-        assert!(
-            self.origins.contains(&url.origin().ascii_serialization()),
-            "HTTP destination must be declared and approved"
-        );
+        let url = url::Url::parse(&request.url)
+            .map_err(|_| HostFailure::new(ErrorKind::Invalid, "invalid HTTP destination"))?;
+        if !self.origins.contains(&url.origin().ascii_serialization()) {
+            return Err(HostFailure::new(
+                ErrorKind::Invalid,
+                "HTTP destination must be declared and approved",
+            ));
+        }
         if url.path() == "/v2/chat/completions" {
             let _ = application_request_body(&request);
         } else {
@@ -2373,7 +2376,6 @@ async fn image_downloads_reject_unapproved_origins_and_never_forward_credentials
     .unwrap();
     let runtime = VendorRuntime::new().unwrap();
     let plugin = runtime.load(&bytes).await.unwrap();
-    let cdn = "https://ai-corpus-backup-1258344699.cos.ap-beijing.myqcloud.com";
     let png = STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=").unwrap();
     let image_request = || stravia_vendor_sdk::MediaImageRequest {
         prompt: "蓝色圆形".into(),
@@ -2381,9 +2383,19 @@ async fn image_downloads_reject_unapproved_origins_and_never_forward_credentials
         aspect_ratio: None,
         resolution: None,
     };
-    for (region, other, domain) in [
-        ("cn", "intl", "www.workbuddy.cn"),
-        ("intl", "cn", "www.workbuddy.ai"),
+    for (region, other, domain, cdn) in [
+        (
+            "cn",
+            "intl",
+            "www.workbuddy.cn",
+            "https://images-1250000001.cos.ap-shanghai.myqcloud.com",
+        ),
+        (
+            "intl",
+            "cn",
+            "www.workbuddy.ai",
+            "https://images-1250000002.cos.ap-singapore.myqcloud.com",
+        ),
     ] {
         let origin = format!("https://{domain}");
         let local = LocalUpstream::new(&[&origin, cdn]);
@@ -2401,6 +2413,8 @@ async fn image_downloads_reject_unapproved_origins_and_never_forward_credentials
         for hostile in [
             "https://127.0.0.1/private",
             "https://evil.test/image.png",
+            "https://images-1250000001.cos.ap-shanghai.myqcloud.com.evil.test/image.png",
+            "https://images-1250000001.cos.ap-shanghai.myqcloud.com:444/image.png",
             if region == "cn" {
                 "https://www.workbuddy.ai/image.png"
             } else {
