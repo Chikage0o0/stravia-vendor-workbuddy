@@ -246,6 +246,14 @@ npx --yes --ignore-scripts rea-agents@6.7.0 --help
 
 启动配置使用 `--ignore-scripts`，避免可选 Frida 依赖的原生安装脚本阻塞下载。Frida 原生绑定不在本次安装范围内；需要动态插桩时须单独完成安装。原生反编译还需自行配置 Ghidra 或 IDA 等分析引擎；注册 MCP 不代表所有分析后端均已就绪。
 
+## v0.3.0 升级说明
+
+- 国内、国际版均新增宿主 `media_image` 操作，支持文生图、最多三张参考图、宽高比与分辨率映射，以及 Base64／URL 图片产物。具体线规与边界见[图片生成](#图片生成)。
+- 模型同步追加账号目录中带 `text-to-image` 或 `image-to-image` 标签的模型；普通视觉模型仍只声明聊天能力，不因支持图片输入而获得生图能力。升级后须重新同步模型。
+- 新增精确的 HTTPS 出站 origin `ai-corpus-backup-1258344699.cos.ap-beijing.myqcloud.com`。重新导入时请核对该权限；产物下载不携带 WorkBuddy 凭据，其他域名及跨区域 URL 均拒绝，不使用通配域名。
+- 国内真实账号已验证 `hunyuan-image-v3.0-art` 出图及 PNG 下载；当前实测国际账号未开放生图模型，官方静态模型返回路由不存在。国际接口支持不代表账号已经获得模型权限，插件不会硬编码或伪造可用模型。
+- 图片操作可能消耗积分，不使用聊天的自动付费线路切换，也不自动重试。既有登录凭据、连接配置和 canonical format 不变；延续支持 HTTP compression API 的宿主要求，国内连接使用 `https://www.workbuddy.cn`。
+
 ## v0.2.3 升级说明
 
 - **身份关联变更**：宿主 root/session ID 改为固定 SHA-256 派生的官方 UUIDv7 外形，分别输出 32/36 字符；模型操作与每次 HTTP 尝试的新 ID 改用真实 UUIDv7。首次切换会改变原先原样发送的上游身份，不能沿用旧会话身份；此后映射跨重载稳定。此改动对齐 ID 形态，不等于已解决原 debug 包中的低缓存命中率。
@@ -284,8 +292,8 @@ npx --yes --ignore-scripts rea-agents@6.7.0 --help
 版本号以 `Cargo.toml` 的 `version` 为准。同步更新 `Cargo.lock` 中本插件的版本，运行 `task verify`，提交版本变更并推送后，打 tag 触发 GitHub Action 构建并发布 Release：
 
 ```bash
-git tag -a v0.2.3 -m "发布 v0.2.3"
-git push origin v0.2.3
+git tag -a v0.3.0 -m "发布 v0.3.0"
+git push origin v0.3.0
 ```
 
 tag 的 `v` 前缀版本号必须与 `Cargo.toml` 一致，否则 workflow 拒绝发布。Release 附件包含 `stravia-vendor-workbuddy-v<版本>.wasm`、`SHA256SUMS`、`LICENSE`、`NOTICE` 及第三方组件许可证。
