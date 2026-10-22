@@ -2362,3 +2362,123 @@ async fn paid_window_survives_login_and_revoke_clears_it() {
         "text resetAt: paid window coexists with pending login, survives login completion, and is removed by revoke"
     );
 }
+
+#[tokio::test]
+#[ignore = "build the release wasm32-wasip2 component first"]
+async fn image_downloads_reject_unapproved_origins_and_never_forward_credentials() {
+    let bytes = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/wasm32-wasip2/release/stravia_vendor_workbuddy.wasm"),
+    )
+    .unwrap();
+    let runtime = VendorRuntime::new().unwrap();
+    let plugin = runtime.load(&bytes).await.unwrap();
+    let cdn = "https://ai-corpus-backup-1258344699.cos.ap-beijing.myqcloud.com";
+    let png = STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=").unwrap();
+    let image_request = || stravia_vendor_sdk::MediaImageRequest {
+        prompt: "蓝色圆形".into(),
+        references: Vec::new(),
+        aspect_ratio: None,
+        resolution: None,
+    };
+    for (region, other, domain) in [
+        ("cn", "intl", "www.workbuddy.cn"),
+        ("intl", "cn", "www.workbuddy.ai"),
+    ] {
+        let origin = format!("https://{domain}");
+        let local = LocalUpstream::new(&[&origin, cdn]);
+        let mut provider = snapshot(region, &origin);
+        provider.model = Some("image-model".into());
+        provider.credentials = BTreeMap::from([
+            ("region".into(), json!(region)),
+            ("domain".into(), json!(domain)),
+            ("uid".into(), json!("image-account")),
+            (
+                "access_token".into(),
+                json!(token(domain, "image-account", 1)),
+            ),
+        ]);
+        for hostile in [
+            "https://127.0.0.1/private",
+            "https://evil.test/image.png",
+            if region == "cn" {
+                "https://www.workbuddy.ai/image.png"
+            } else {
+                "https://www.workbuddy.cn/image.png"
+            },
+        ] {
+            local.reply(Reply::json(
+                json!({"code":0,"data":{"data":[{"url":hostile}]}}),
+            ));
+            let before = local.requests.lock().len();
+            assert!(
+                run(
+                    &runtime,
+                    &plugin,
+                    region,
+                    OperationInput::MediaImage {
+                        provider: provider.clone(),
+                        request: image_request(),
+                    },
+                    local.scope(),
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(local.requests.lock().len(), before + 1);
+            assert!(local.replies.lock().is_empty());
+        }
+        local.reply(Reply::json(json!({
+            "code":0,
+            "data":{"data":[{"url":format!("{cdn}/image.png?signature=synthetic")}],
+                    "usage":{"input_tokens":346,"output_tokens":464,"total_tokens":810,"credit":5.71}}
+        })));
+        local.reply(Reply {
+            status: 200,
+            headers: vec![("Content-Type".into(), "image/png".into())],
+            chunks: Mutex::new(VecDeque::from([png.clone()])),
+        });
+        let output = run(
+            &runtime,
+            &plugin,
+            region,
+            OperationInput::MediaImage {
+                provider: provider.clone(),
+                request: image_request(),
+            },
+            local.scope(),
+        )
+        .await
+        .unwrap();
+        let OperationOutput::MediaImage(output) = output else {
+            panic!("expected image output");
+        };
+        assert_eq!(output.artifacts[0].bytes, png);
+        assert!(output.artifacts[0].upstream_ref.is_none());
+        assert_eq!(output.usage.unwrap().total_tokens, 810);
+        {
+            let requests = local.requests.lock();
+            let download = requests.last().unwrap();
+            assert_eq!(download.method, "GET");
+            assert_eq!(download.headers, [("Accept".into(), "image/*".into())]);
+            assert!(download.body.is_empty());
+        }
+        provider.credentials.insert("region".into(), json!(other));
+        let before = local.requests.lock().len();
+        assert!(
+            run(
+                &runtime,
+                &plugin,
+                region,
+                OperationInput::MediaImage {
+                    provider,
+                    request: image_request(),
+                },
+                local.scope(),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(local.requests.lock().len(), before);
+    }
+}

@@ -18,6 +18,15 @@ fn valid_id(id: &str) -> bool {
         && !id.chars().any(char::is_control)
 }
 
+fn image_model(row: &Value) -> bool {
+    row.get("tags")
+        .and_then(Value::as_array)
+        .is_some_and(|tags| {
+            tags.iter()
+                .any(|tag| matches!(tag.as_str(), Some("text-to-image" | "image-to-image")))
+        })
+}
+
 fn configured_ids(options: &BTreeMap<String, Value>) -> Result<Vec<&str>, ()> {
     let Some(value) = options.get("model_ids") else {
         return Ok(Vec::new());
@@ -317,6 +326,17 @@ fn client_catalog(config: &Value) -> Result<DiscoverResponse, PluginError> {
             }
         }
     }
+    for row in rows.iter().filter(|row| image_model(row)) {
+        let id = row.get("id").and_then(Value::as_str).ok_or_else(|| {
+            common::plugin_error(
+                ErrorKind::upstream_unknown(),
+                "image model catalog entry has no ID",
+            )
+        })?;
+        if seen.insert(id.to_owned()) {
+            selected.push(row);
+        }
+    }
     if selected.is_empty() {
         return Err(common::plugin_error(
             ErrorKind::upstream_unknown(),
@@ -435,7 +455,23 @@ fn parse_models<'a>(
         if !limit.is_empty() {
             metadata.insert("limit".into(), Value::Object(limit));
         }
-        if let Some(images) = row.get("supportsImages").and_then(Value::as_bool) {
+        let image = image_model(row);
+        if image {
+            let references = row
+                .get("tags")
+                .and_then(Value::as_array)
+                .is_some_and(|tags| {
+                    tags.iter()
+                        .any(|tag| tag.as_str() == Some("image-to-image"))
+                });
+            metadata.insert(
+                "modalities".into(),
+                json!({
+                    "input": if references { vec!["text", "image"] } else { vec!["text"] },
+                    "output": ["image"]
+                }),
+            );
+        } else if let Some(images) = row.get("supportsImages").and_then(Value::as_bool) {
             let input = if images {
                 vec!["text", "image"]
             } else {
@@ -468,8 +504,8 @@ fn parse_models<'a>(
             id: id.into(),
             display_name: row.get("name").and_then(Value::as_str).unwrap_or(id).into(),
             family: None,
-            selector: None,
-            capabilities: Vec::new(),
+            selector: image.then(|| id.into()),
+            capabilities: vec![if image { "media_image" } else { "infer" }.into()],
             metadata,
         });
     }
@@ -482,6 +518,39 @@ fn parse_models<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_models_are_discovered_outside_the_chat_agent_without_promoting_vision() {
+        let config = json!({
+            "agents": [{"name":"cli", "tags":["default"], "models":["vision"]}],
+            "models": [
+                {"id":"vision", "supportsImages":true},
+                {"id":"hunyuan-image-v3.0-art", "tags":["text-to-image"]},
+                {"id":"hidden-chat", "supportsImages":true}
+            ]
+        });
+        let response = client_catalog(&config).unwrap();
+        let vision = &response.models[0];
+        assert_eq!(vision.id, "vision");
+        assert_eq!(vision.capabilities, ["infer"]);
+        assert_eq!(
+            vision.metadata["modalities"],
+            json!({"input":["text","image"], "output":["text"]})
+        );
+        let image = &response.models[1];
+        assert_eq!(image.id, "hunyuan-image-v3.0-art");
+        assert_eq!(image.capabilities, ["media_image"]);
+        assert_eq!(
+            image.metadata["modalities"],
+            json!({"input":["text"], "output":["image"]})
+        );
+        assert!(
+            !response
+                .models
+                .iter()
+                .any(|model| model.id == "hidden-chat")
+        );
+    }
 
     #[test]
     fn rejects_ambiguous_model_configuration() {

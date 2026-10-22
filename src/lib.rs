@@ -1,6 +1,7 @@
 mod allowance;
 mod auth;
 mod inference;
+mod media_generation;
 mod models;
 mod profile;
 mod request_context;
@@ -135,6 +136,10 @@ impl VendorGuest for WorkBuddy {
         match input {
             OperationInput::Infer { provider, request } => {
                 inference::execute(host, &provider, region, request)
+            }
+            OperationInput::MediaImage { provider, request } => {
+                media_generation::generate(host, &provider, region, request)
+                    .map(OperationOutput::MediaImage)
             }
             OperationInput::Auth { provider, request } => {
                 auth::execute(host, &provider, region, request).map(OperationOutput::Auth)

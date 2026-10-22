@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use semver::Version;
 use stravia_vendor_sdk::{
     AuthDescriptor, AuthFlow, CANONICAL_FORMAT_VERSION, Capability, ChannelDescriptor, ConfigField,
-    ConfigFieldKind, DataCompatibility, NetworkDeclaration, ProviderDescriptor, VendorDescriptor,
-    VendorKind,
+    ConfigFieldKind, DataCompatibility, NetworkDeclaration, OriginDeclaration, ProviderDescriptor,
+    VendorDescriptor, VendorKind,
 };
 
 use crate::{Region, VENDOR_ID, messages};
@@ -12,6 +12,7 @@ use crate::{Region, VENDOR_ID, messages};
 pub(crate) fn descriptor() -> VendorDescriptor {
     let capabilities = BTreeSet::from([
         Capability::Infer,
+        Capability::MediaImage,
         Capability::AuthOauth,
         Capability::ModelDiscovery,
         Capability::Allowance,
@@ -78,7 +79,14 @@ pub(crate) fn descriptor() -> VendorDescriptor {
                 pattern: None,
                 visible_when: None,
             }],
-            network: NetworkDeclaration::default(),
+            network: NetworkDeclaration {
+                extra_origins: vec![OriginDeclaration {
+                    scheme: "https".into(),
+                    host: crate::media_generation::IMAGE_CDN_HOST.into(),
+                    port: None,
+                }],
+                ..Default::default()
+            },
             data_compat: DataCompatibility::default(),
         }],
     }

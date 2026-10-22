@@ -9,6 +9,7 @@
 - 🔐 **浏览器授权登录** — 打开授权链接完成 QQ / 微信 / 手机号登录，无需手动复制 token；令牌自动刷新与撤销
 - 🌐 **双区域隔离** — 国内版（`www.workbuddy.cn`）与国际版（`www.workbuddy.ai`）两个 channel，凭据与流量严格限定在所选区域
 - 🤖 **模型自动发现** — 从账号 `/v3/config` 的默认 agent 名单实时发现模型，按上游配置合并免费／付费线路；自定义模型可在宿主的可用模型页面手动添加
+- **图片生成** — 国内、国际版均接入宿主 `media_image` 操作；按账号目录的图片标签发现模型，支持文生图及最多三张参考图
 - **可选自动付费线路** — 默认关闭；开启后可在免费线路返回 `6004` 频控错误、且尚未输出响应时自动切换付费线路并消耗积分
 - 📊 **额度查询** — 从所选区域的新版计费汇总接口读取账号积分资源包余量
 - 🧩 **wasm 沙箱组件** — 仅能访问插件声明的网络 origin，凭据由宿主持久化并跨连接隔离
@@ -43,6 +44,46 @@ API Key:  由 Stravia 访问控制配置决定
 ```
 
 客户端按 OpenAI 兼容协议调用，Stravia 负责路由到本插件并转换为 WorkBuddy 上游协议。
+
+## 图片生成
+
+在支持图片 Route 的 Stravia 宿主中使用 `media_image` 操作。两个 channel 均声明该能力，但模型是否可用仍由对应区域的账号配置和上游路由决定；不把普通聊天模型的 `supportsImages`（图片输入）误认为图片生成能力。
+
+自动发现保留默认 agent 的聊天模型及顺序，再追加 `/v3/config.models` 中带 `text-to-image` 或 `image-to-image` 标签的模型，按 ID 去重。图片模型声明 `media_image` 和图片输出；带 `image-to-image` 标签时同时声明图片输入。聊天模型明确声明 `infer`，不会因新增插件能力而自动获得生图能力。国际客户端静态目录中的图片模型不会覆盖账号返回的真实目录。
+
+### 请求与产物
+
+- 文生图：所选区域的 `POST /v2/images/generations`；有参考图时改为 `POST /v2/images/edits`。使用 JSON 请求与响应，不走聊天 SSE。
+- 请求使用宿主选定的上游模型，不设置生图默认模型或跨区域回退。Hunyuan 请求单张图片；OpenAI 风格模型另外请求 `response_format: "b64_json"`；Gemini 风格模型保留客户端的基础字段。
+- 参考图由宿主先物化为字节，再编码为 `image` 数组中的 data URL；最多三张，每张非空且不超过 32 MiB。插件不获取用户提供的任意参考图 URL。
+- 提示词不能为空。`aspect_ratio` 和 `resolution` 转为上游 `size: "宽x高"`，缺省为正方形 1K；1K 的长边为 1024，2K、4K 分别在下表尺寸上乘 2、4。模型若不接受某个尺寸，直接返回上游错误，不静默改尺寸或重试。
+
+| `aspect_ratio` | 1K 的 `size` |
+|---------------|-------------|
+| `1:1` | `1024x1024` |
+| `3:4` | `768x1024` |
+| `4:3` | `1024x768` |
+| `9:16` | `576x1024` |
+| `16:9` | `1024x576` |
+
+仅接受成功响应中的单张图片；空结果、多图、业务错误及损坏的 Base64 均报错。`b64_json` 解码为图片字节；URL 产物只允许所选区域的 HTTPS origin，以及已核实的固定 HTTPS origin `https://ai-corpus-backup-1258344699.cos.ap-beijing.myqcloud.com`。不接受其他域名、跨区域 URL、嵌入式凭据或非标准端口，不从响应动态扩大网络权限。
+
+产物 GET 只发送 `Accept: image/*`，不转发 WorkBuddy 的 Authorization、账号、企业或会话头。下载要求图片 MIME，图片字节上限为 32 MiB；签名 URL 不进入返回产物。实际图片格式与像素内容由 Core 统一解码校验。重新导入插件时，宿主会展示新增的精确 COS 出站权限；未来上游改用其他 CDN 时会明确失败，需重新核实并更新声明，不能扩大为通配域名。
+
+存在的 `input_tokens`、`output_tokens`、`total_tokens` 映射为 canonical token 用量；缺失 token 计量时不伪造零用量。上游原始图片计数和 `credit` 等计量保存在产物 `metadata.workbuddy_usage`，不把积分当作 token。图片生成可能消耗积分；`auto_paid_on_rate_limit` 只控制聊天线路，不作用于图片请求，图片请求没有自动付费切换或重试。
+
+### 已验证的账号状态
+
+2026-10-22 使用本机真实凭据分别查询两区 `/v3/config`，均为 HTTP 200 / `code: 0`：
+
+| 区域 | 账号目录 | 授权范围内的单次真实生图 |
+|------|----------|------------------------|
+| 国内 | 37 个模型，`hunyuan-image-v3.0-art` 带 `text-to-image` 标签 | HTTP 200 / `code: 0`；从上述 COS 域下载并解码为 1024×1024 PNG，上游报告 `credit: 5.71` |
+| 国际 | 28 个模型，无生图标签 | 官方静态模型 `gpt-image-2.5-sunburst` 返回 HTTP 400 / `14401`，提示模型路由不存在；不将它硬编码为可用模型 |
+
+这证明国内账号的接口与产物格式，不承诺其他账号的权限、价格或模型尺寸。国际操作入口已实现，但当前实测账号没有可用生图模型；重新同步后只展示上游实际开放的模型。两区各只发起一次真实生图，没有自动重试。真实 API 核验使用直接请求，不等同于已在用户宿主中导入并完成线上端到端调用。
+
+本次 release Wasm 另通过 36 项单元测试、11 项真实组件契约，以及独立程序的 7 个场景、8 次真实 loopback TCP 交换。回放使用脱敏后的真实目录和国内生成的 PNG、合成凭据，验证两区发现、URL 下载、Base64 文生图、参考图、尺寸映射、上游错误不重试及未批准 URL 拒绝；不把国际离线成功响应当作线上出图成功。组件契约同时检查下载不泄露凭据和跨区域凭据在出站前被拒绝。
 
 ## 可选配置
 
@@ -149,18 +190,18 @@ Node 版本选择已安装 WorkBuddy 所用 Electron `37.10.3` 对应的 Node `2
 | 国内 | `https://www.workbuddy.cn` | `workbuddy` |
 | 国际 | `https://www.workbuddy.ai` | `workbuddy-ai` |
 
-认证、模型发现、聊天和积分查询均使用所选区域的固定 origin：
+认证、模型发现、聊天、生图账号 API 和积分查询均使用所选区域的固定 origin；图片产物下载另遵循上述精确 origin 限制：
 
 - 授权状态：`POST /v2/plugin/auth/state?platform=...`；令牌轮询：`GET /v2/plugin/auth/token?state=...`。
 - 令牌刷新：`POST /v2/plugin/auth/token/refresh`，两个区域均发送 `X-Auth-Refresh-Source: plugin`。
 - 模型配置：`GET /v3/config`；聊天：`POST /v2/chat/completions`。
 - 积分汇总：`POST /billing/meter/get-user-resource-summary`，请求体为 `{}`；对 `data.Packages` 中的 `CycleTotalCapacity`、`CycleRemainCapacity`、`CycleUsedCapacity` 做十进制精确求和。接口不分页；缺失或非法的周期额度字段会导致查询失败，不返回部分余额。请求发送桌面产品 User-Agent、`X-Request-ID`、账号与企业身份头，不再使用旧计费信封。
 
-插件不再声明旧国内计费域，也不接受旧国内 base URL；配置响应中的 `data.endpoint` 不会改变固定目的地或扩大网络权限。升级后须重新导入插件，把已有国内连接的 base URL 改为 `https://www.workbuddy.cn`，并重新同步模型。此次升级不新增生图接口。
+插件不再声明旧国内计费域，也不接受旧国内 base URL；配置响应中的 `data.endpoint` 不会改变固定目的地或扩大网络权限。升级后须重新导入插件，把已有国内连接的 base URL 改为 `https://www.workbuddy.cn`，并重新同步模型。
 
 ### 模型发现与线路选择
 
-自动发现现在遵循客户端的默认 agent 名单及顺序，不再用 `credits` 字段猜测可选模型，也不回退到全量后端目录。缺少有效名单时明确报错。免费／付费配对来自 `productFeaturesConfig.ModelRateLimitCap.lines`：默认列表只显示 `freeId`，名称优先使用配对的 `displayName`；不按名称合并无关模型。
+聊天模型发现遵循客户端的默认 agent 名单及顺序，不再用 `credits` 字段猜测可选模型，也不回退到全量后端目录；图片标签模型按上述规则追加。缺少有效名单时明确报错。免费／付费配对来自 `productFeaturesConfig.ModelRateLimitCap.lines`：默认列表只显示 `freeId`，名称优先使用配对的 `displayName`；不按名称合并无关模型。
 
 自动付费开关的行为如下：
 
@@ -257,6 +298,7 @@ tag 的 `v` 前缀版本号必须与 `Cargo.toml` 一致，否则 workflow 拒�
 │   ├── auth.rs         # 浏览器登录 Start/Poll/Refresh/Revoke
 │   ├── models.rs       # 默认 agent 模型发现、线路配对与配置校验
 │   ├── inference.rs    # OpenAI 兼容推理与 6004 付费线路切换
+│   ├── media_generation.rs # 图片生成、参考图与无凭据产物下载
 │   ├── state.rs        # 认证与付费窗口共享的私有状态读写
 │   ├── allowance.rs    # 积分额度查询
 │   └── profile.rs      # VendorDescriptor / ProviderDescriptor 声明
