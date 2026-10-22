@@ -205,20 +205,25 @@ npx --yes --ignore-scripts rea-agents@6.7.0 --help
 
 启动配置使用 `--ignore-scripts`，避免可选 Frida 依赖的原生安装脚本阻塞下载。Frida 原生绑定不在本次安装范围内；需要动态插桩时须单独完成安装。原生反编译还需自行配置 Ghidra 或 IDA 等分析引擎；注册 MCP 不代表所有分析后端均已就绪。
 
+## v0.2.3 升级说明
+
+- **身份关联变更**：宿主 root/session ID 改为固定 SHA-256 派生的官方 UUIDv7 外形，分别输出 32/36 字符；模型操作与每次 HTTP 尝试的新 ID 改用真实 UUIDv7。首次切换会改变原先原样发送的上游身份，不能沿用旧会话身份；此后映射跨重载稳定。此改动对齐 ID 形态，不等于已解决原 debug 包中的低缓存命中率。
+- root/session 仅使用可信宿主元数据；缺失或非法 root 退化为本次操作的新 UUIDv7，缺失或非法 session 则省略会话头与对应 baggage。客户端不能覆盖身份来源，免费→付费切换保留同一模型操作的关联。
+- 连接设置移除“自定义模型 ID”输入框；额外模型改在宿主的可用模型页面添加。旧 `model_ids` 仍可读取，但编辑保存旧连接前须从 `vendor_options` 移除该键，不能只清空其值。
+- 本次 ID 映射更新先确认旧组件原样发送 root 的回归契约失败，再通过 30 项单元测试和全部 10 项 Wasm 组件契约。独立程序加载本次国际版 Wasm，以测试用 TCP adapter 完成 10 个场景、11 次真实 loopback HTTP 交换，验证免费→付费、子调用与重载稳定性、不同会话隔离、UTF-8/CRLF/NUL 源 ID、空值／错误类型／缺失元数据，以及 header/baggage 关联。仅使用合成凭据、本地服务并显式关闭 gzip；这次冒烟没有运行生产 HTTP encoder，也没有调用真实上游或重新测量缓存命中率。
+
 ## v0.2.2 升级说明
 
 - **升级要求**：须先升级到支持新版 HTTP compression API 的 Stravia 宿主，再重新导入组件；国内连接的 base URL 使用 `https://www.workbuddy.cn`，升级后重新同步模型。
 - 认证、配置、聊天与积分查询切换为新版客户端接口和区域身份；保留区域凭据隔离，移除旧国内计费 origin，不提供旧地址回退。
 - 额度查询改为单次资源包汇总，保留精确的小数积分，拒绝不完整数据；不再依赖旧资源列表分页或套餐名称。
 - 补充轮次 root、B3 单头及 parent 扩展，按模型／HTTP 分层传播 W3C 上下文；ACP 按真实连接来源处理，缺失不伪造。
-- 宿主 root/session ID 改为固定 SHA-256 派生的官方 UUIDv7 外形，分别输出 32/36 字符；模型操作与每次 HTTP 尝试的新 ID 改用真实 UUIDv7。首次切换会改变原先原样发送的上游身份，不能沿用旧会话身份；此后映射跨重载稳定。此改动对齐 ID 形态，不等于已解决原 debug 包中的低缓存命中率。
 - 产品身份取官方配置或默认 `SaaS`；聊天通过宿主 HTTP compression API 请求 gzip，Guest 只传原始 JSON，尊重官方显式关闭；传输头与长度由宿主管理，错误不触发裸请求重发。
 - 固定远端 Stravia dev 提交 `20c1291c142d5c19ba267552a6bfbdbb1c947bc6`，Rust workspace SDK crate 版本为 `0.5.2`、WIT ABI 为 `0.5.1`，构建工具链更新为 Rust `1.99.1`；canonical format 保持 `1`。须升级支持新 API 的宿主后重新构建并导入组件。
 - 聊天按真实账号条件生成企业 `X-Userinfo`，按产品配置生成 `X-Private-Data`，并补齐普通聊天 Agent 缺省；这些字段不进入发现或额度请求。保留请求上下文与重试生命周期，不接受客户端伪造身份，也不虚构缺少来源的 Agent、父会话或上下文压缩状态。
 - 聊天补齐上述八项固定 Windows/x64 SDK 兼容头；客户端和 operation metadata 无法覆盖，不放行未知 Stainless 字段或 helper/poll 头。免费与付费线路都以新的 SDK 请求计数，不改变宿主超时及压缩行为。
 - 本轮请求头对齐使用上述固定 SDK 和 Rust `1.99.1` 完成 release Wasm 构建，通过 30 项单元测试与 10 项真实 Wasm 组件契约。独立 TCP 冒烟加载同一组件，4 个场景、5 次真实 loopback 交换验证了企业／个人身份、隐私开关缺失和错误类型、客户端及 metadata 伪造过滤、八项固定 SDK 头唯一且无额外字段、免费／付费计数均为零，以及 Agent 普通缺省和请求与 trace 生命周期。此次头部冒烟显式关闭 gzip，仅使用合成凭据与本地服务，未调用真实上游。
 - SDK 迁移时另行验证的 loopback TCP 冒烟使用上游未修改的生产 HTTP 编码器：国内免费／付费请求均为单层 gzip，国际显式关闭后为原始 JSON；Unicode、产品快照、root/message 关联和单次 `UpstreamStarted` 均通过。宿主运行上下文的跨子执行根关联仍需同步构建宿主修改；设备令牌不包含原生 SDK 集成。
-- 本次 ID 映射更新先确认旧组件原样发送 root 的回归契约失败，再通过 30 项单元测试和全部 10 项 Wasm 组件契约。独立程序加载本次国际版 Wasm，以测试用 TCP adapter 完成 10 个场景、11 次真实 loopback HTTP 交换，验证免费→付费、子调用与重载稳定性、不同会话隔离、UTF-8/CRLF/NUL 源 ID、空值／错误类型／缺失元数据，以及 header/baggage 关联。仅使用合成凭据、本地服务并显式关闭 gzip；这次冒烟没有运行生产 HTTP encoder，也没有调用真实上游或重新测量缓存命中率。
 
 ## v0.2.1 升级说明
 
@@ -238,8 +243,8 @@ npx --yes --ignore-scripts rea-agents@6.7.0 --help
 版本号以 `Cargo.toml` 的 `version` 为准。同步更新 `Cargo.lock` 中本插件的版本，运行 `task verify`，提交版本变更并推送后，打 tag 触发 GitHub Action 构建并发布 Release：
 
 ```bash
-git tag -a v0.2.2 -m "发布 v0.2.2"
-git push origin v0.2.2
+git tag -a v0.2.3 -m "发布 v0.2.3"
+git push origin v0.2.3
 ```
 
 tag 的 `v` 前缀版本号必须与 `Cargo.toml` 一致，否则 workflow 拒绝发布。Release 附件包含 `stravia-vendor-workbuddy-v<版本>.wasm`、`SHA256SUMS`、`LICENSE`、`NOTICE` 及第三方组件许可证。
