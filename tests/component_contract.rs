@@ -1445,11 +1445,9 @@ fn requested_models(local: &LocalUpstream) -> Vec<String> {
 async fn request_context_survives_retry_and_separates_model_calls() {
     let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("target/wasm32-wasip2/release/stravia_vendor_workbuddy.wasm");
+    let component = std::fs::read(artifact).unwrap();
     let runtime = VendorRuntime::new().unwrap();
-    let plugin = runtime
-        .load(&std::fs::read(artifact).unwrap())
-        .await
-        .unwrap();
+    let plugin = runtime.load(&component).await.unwrap();
     let local = LocalUpstream::new(&["https://www.workbuddy.cn"]);
     let mut provider = paid_provider();
     provider
@@ -1473,6 +1471,9 @@ async fn request_context_survives_retry_and_separates_model_calls() {
             "traceparent".into(),
             "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-00".into(),
         ),
+        ("x-conversation-id".into(), "client-session".into()),
+        ("x-conversation-request-id".into(), "client-request".into()),
+        ("x-conversation-message-id".into(), "client-message".into()),
         ("acp-connection-id".into(), "client-fake-connection".into()),
     ];
     local.reply(Reply::json(json!({"code":6004})));
@@ -1526,7 +1527,7 @@ async fn request_context_survives_retry_and_separates_model_calls() {
         &plugin,
         "cn",
         OperationInput::Infer {
-            provider,
+            provider: provider.clone(),
             request: request(),
         },
         local.scope(),
@@ -1538,18 +1539,75 @@ async fn request_context_survives_retry_and_separates_model_calls() {
         "next turn"
     );
 
-    assert_eq!(requested_models(&local), ["hy3", "hy3-x", "hy3", "hy3"]);
+    let reloaded_runtime = VendorRuntime::new().unwrap();
+    let reloaded_plugin = reloaded_runtime.load(&component).await.unwrap();
+    local.reply(Reply::stream(&completion_stream("hy3", "reloaded")));
+    run(
+        &reloaded_runtime,
+        &reloaded_plugin,
+        "cn",
+        OperationInput::Infer {
+            provider: provider.clone(),
+            request: request(),
+        },
+        local.scope(),
+    )
+    .await
+    .unwrap();
+
+    provider
+        .operation_metadata
+        .insert("session_affinity".into(), json!("another-host-session"));
+    local.reply(Reply::stream(&completion_stream("hy3", "new session")));
+    run(
+        &reloaded_runtime,
+        &reloaded_plugin,
+        "cn",
+        OperationInput::Infer {
+            provider,
+            request: request(),
+        },
+        local.scope(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        requested_models(&local),
+        ["hy3", "hy3-x", "hy3", "hy3", "hy3", "hy3"]
+    );
     let requests = local.requests.lock();
     let first = &requests[0];
     let retry = &requests[1];
     let child = &requests[2];
     let next = &requests[3];
+    let reloaded = &requests[4];
+    let new_session = &requests[5];
     assert_eq!(
         application_request_body(first)["messages"],
         application_request_body(retry)["messages"]
     );
     for wire in requests.iter() {
         assert_chat_compression(wire, true);
+        assert_eq!(request_header(wire, "x-conversation-id").unwrap().len(), 36);
+        for name in [
+            "x-root-request-id",
+            "x-conversation-request-id",
+            "x-conversation-message-id",
+            "x-request-id",
+        ] {
+            let value = request_header(wire, name).unwrap();
+            assert_eq!(value.len(), 32, "{name} must omit UUID separators");
+            assert!(
+                value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "{name} must use lowercase hexadecimal"
+            );
+            let id = uuid::Uuid::parse_str(value).unwrap();
+            assert_eq!(id.get_version(), Some(uuid::Version::SortRand));
+            assert_eq!(id.get_variant(), uuid::Variant::RFC4122);
+        }
         assert_eq!(
             request_header(wire, "x-stainless-retry-count"),
             Some("0"),
@@ -1568,7 +1626,7 @@ async fn request_context_survives_retry_and_separates_model_calls() {
     for wire in &requests[..3] {
         assert_eq!(
             request_header(wire, "x-root-request-id"),
-            Some("user-run-a")
+            Some("c845b199d22c77b88bf012ecdc201766")
         );
         assert_eq!(
             request_header(wire, "x-b3-traceid"),
@@ -1628,8 +1686,12 @@ async fn request_context_survives_retry_and_separates_model_calls() {
         request_header(next, "x-conversation-id")
     );
     assert_eq!(
+        request_header(first, "x-conversation-id"),
+        Some("16e7ce41-5946-7f64-a10a-02d18223460e")
+    );
+    assert_eq!(
         request_header(next, "x-root-request-id"),
-        Some("user-run-b")
+        Some("29f6aa535a2a79c99ec09e843f64b19f")
     );
     assert_eq!(
         request_header(next, "x-b3-traceid"),
@@ -1637,6 +1699,28 @@ async fn request_context_survives_retry_and_separates_model_calls() {
     );
     assert_eq!(request_header(next, "x-b3-sampled"), Some("0"));
     assert!(request_header(next, "tracestate").is_none());
+    for name in ["x-root-request-id", "x-conversation-id"] {
+        assert_eq!(
+            request_header(next, name),
+            request_header(reloaded, name),
+            "{name} must be independent of the plugin instance"
+        );
+    }
+    assert_eq!(
+        request_header(reloaded, "x-root-request-id"),
+        request_header(new_session, "x-root-request-id"),
+        "changing the session source must not change the run identity"
+    );
+    assert_ne!(
+        request_header(reloaded, "x-conversation-id"),
+        request_header(new_session, "x-conversation-id"),
+        "distinct host sessions must not share the upstream cache identity"
+    );
+    assert_ne!(
+        request_header(next, "x-conversation-request-id"),
+        request_header(reloaded, "x-conversation-request-id"),
+        "a new model operation must retain its own request identity"
+    );
     assert!(
         request_header(first, "baggage")
             .unwrap()

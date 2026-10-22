@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::BTreeMap, fmt::Write as _};
+use std::{collections::BTreeMap, fmt::Write as _};
 
 use opentelemetry::{
     Context,
@@ -11,13 +11,14 @@ use opentelemetry_sdk::{
     trace::{IdGenerator, RandomIdGenerator},
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use stravia_vendor_sdk::{GuestHost, LogLevel, ProviderSnapshot};
 
 /// 用户运行的 root 与父上下文由宿主提供；模型 span 跨内部重试，HTTP span 每次新建。
 pub(crate) struct RequestContext<'a> {
-    root_request_id: Cow<'a, str>,
+    root_request_id: String,
     conversation_request_id: String,
-    conversation_id: Option<&'a str>,
+    conversation_id: Option<String>,
     acp_connection_id: Option<&'a str>,
     model_span: SpanContext,
     parent_span_id: Option<SpanId>,
@@ -26,14 +27,14 @@ pub(crate) struct RequestContext<'a> {
 impl<'a> RequestContext<'a> {
     pub(crate) fn new(host: &GuestHost, provider: &'a ProviderSnapshot) -> Self {
         let metadata = &provider.operation_metadata;
-        let root_request_id = metadata_header(host, metadata, "root_request_id")
-            .map(Cow::Borrowed)
+        let root_request_id = mapped_host_id(host, metadata, "root_request_id")
+            .map(|id| id.simple().to_string())
             .unwrap_or_else(|| {
                 host.log(
                     LogLevel::Warn,
                     "WorkBuddy host root_request_id is unavailable; using an inference-scoped root",
                 );
-                Cow::Owned(uuid::Uuid::new_v4().simple().to_string())
+                new_request_id()
             });
         let parent_context = TraceContextPropagator::new().extract(&MetadataCarrier(metadata));
         let parent = parent_context.span().span_context().clone();
@@ -66,8 +67,9 @@ impl<'a> RequestContext<'a> {
         }
         Self {
             root_request_id,
-            conversation_request_id: uuid::Uuid::new_v4().simple().to_string(),
-            conversation_id: metadata_header(host, metadata, "session_affinity"),
+            conversation_request_id: new_request_id(),
+            conversation_id: mapped_host_id(host, metadata, "session_affinity")
+                .map(|id| id.hyphenated().to_string()),
             acp_connection_id,
             model_span: SpanContext::new(trace_id, ids.new_span_id(), flags, false, state),
             parent_span_id,
@@ -75,7 +77,7 @@ impl<'a> RequestContext<'a> {
     }
 
     pub(crate) fn apply(&self, headers: &mut Vec<(String, String)>) {
-        let message_id = uuid::Uuid::new_v4().simple().to_string();
+        let message_id = new_request_id();
         headers.push(("x-request-id".into(), message_id.clone()));
         headers.push(("x-conversation-message-id".into(), message_id));
         headers.push(("x-root-request-id".into(), self.root_request_id.to_string()));
@@ -83,15 +85,13 @@ impl<'a> RequestContext<'a> {
             "x-conversation-request-id".into(),
             self.conversation_request_id.clone(),
         ));
-        if let Some(conversation_id) = self.conversation_id {
+        if let Some(conversation_id) = self.conversation_id.as_deref() {
             headers.push(("x-conversation-id".into(), conversation_id.to_owned()));
             let mut baggage = String::with_capacity(
                 64 + conversation_id.len() + self.conversation_request_id.len(),
             );
             baggage.push_str("codebuddy.session_id=");
-            baggage.extend(url::form_urlencoded::byte_serialize(
-                conversation_id.as_bytes(),
-            ));
+            baggage.push_str(conversation_id);
             baggage.push_str(",codebuddy.conversation_request_id=");
             baggage.push_str(&self.conversation_request_id);
             headers.push(("baggage".into(), baggage));
@@ -121,6 +121,39 @@ impl<'a> RequestContext<'a> {
         let http_context = Context::new().with_remote_span_context(http_span);
         TraceContextPropagator::new().inject_context(&http_context, &mut HeaderCarrier(headers));
     }
+}
+
+fn new_request_id() -> String {
+    uuid::Uuid::now_v7().simple().to_string()
+}
+
+fn mapped_host_id(
+    host: &GuestHost,
+    metadata: &BTreeMap<String, Value>,
+    key: &str,
+) -> Option<uuid::Uuid> {
+    let value = metadata.get(key)?;
+    let Some(source) = value.as_str().filter(|value| !value.is_empty()) else {
+        host.log(
+            LogLevel::Warn,
+            &format!("WorkBuddy invalid host identifier `{key}` omitted"),
+        );
+        return None;
+    };
+    // 此映射是跨重载的身份契约：完整 UTF-8 输入、命名域和 UUID 位布局均不能随意改变。
+    // 只匹配官方 UUIDv7 的位格式；摘要不表示真实时间，也不用于认证或密钥转换。
+    let mut hash = Sha256::new();
+    hash.update(b"stravia-workbuddy-id-v1\0");
+    hash.update(source.as_bytes());
+    let digest = hash.finalize();
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Some(
+        uuid::Builder::from_bytes(bytes)
+            .with_variant(uuid::Variant::RFC4122)
+            .with_version(uuid::Version::SortRand)
+            .into_uuid(),
+    )
 }
 
 fn metadata_header<'a>(

@@ -8,7 +8,7 @@
 
 - 🔐 **浏览器授权登录** — 打开授权链接完成 QQ / 微信 / 手机号登录，无需手动复制 token；令牌自动刷新与撤销
 - 🌐 **双区域隔离** — 国内版（`www.workbuddy.cn`）与国际版（`www.workbuddy.ai`）两个 channel，凭据与流量严格限定在所选区域
-- 🤖 **模型自动发现** — 从账号 `/v3/config` 的默认 agent 名单实时发现模型，按上游配置合并免费／付费线路；可选 `model_ids` 白名单只同步指定模型
+- 🤖 **模型自动发现** — 从账号 `/v3/config` 的默认 agent 名单实时发现模型，按上游配置合并免费／付费线路；自定义模型可在宿主的可用模型页面手动添加
 - **可选自动付费线路** — 默认关闭；开启后可在免费线路返回 `6004` 频控错误、且尚未输出响应时自动切换付费线路并消耗积分
 - 📊 **额度查询** — 从所选区域的新版计费汇总接口读取账号积分资源包余量
 - 🧩 **wasm 沙箱组件** — 仅能访问插件声明的网络 origin，凭据由宿主持久化并跨连接隔离
@@ -48,8 +48,9 @@ API Key:  由 Stravia 访问控制配置决定
 
 | 字段 | 说明 |
 |------|------|
-| `model_ids` | 自定义模型 ID，每行一个。填写后仅同步这些明确指定的 ID；留空时按账号 `/v3/config` 的默认 agent 名单发现并合并免费／付费线路。模型发现不检测额度或调用模型 |
 | `auto_paid_on_rate_limit` | 布尔值，默认 `false`。开启即允许免费线路返回 `6004` 频控错误后，自动使用上游配置且允许切换的付费线路，可能消耗积分 |
+
+连接设置不再提供“自定义模型 ID”输入框。需要额外模型时，在宿主的可用模型页面手动添加；自动同步仍按账号配置发现模型。已保存连接中的 `model_ids` 仍按原规则读取，本次不迁移或删除既有配置。若旧连接保存过该键，宿主会将其识别为未声明配置并阻止编辑保存，需从该连接的 `vendor_options` 中移除 `model_ids`，并保留其他选项；仅将其值设为空字符串不能移除该键。
 
 ### 推理请求参数白名单
 
@@ -128,9 +129,12 @@ Node 版本选择已安装 WorkBuddy 所用 Electron `37.10.3` 对应的 Node `2
 ### 请求上下文与 gzip
 
 - `X-Product` 使用模型发现保存的官方 `deploymentType`，缺失时默认 `SaaS`，不接受客户端覆盖。`deploymentType` 和 `productFeatures.RequestBodyGzip` 分别保存到现有模型元数据扩展 `workbuddy_deployment_type`、`workbuddy_request_body_gzip`；免费／付费线路共用当前操作的产品配置快照。更新后需重新同步模型；手动模型 ID 未读取产品配置时使用产品默认值。
-- `operation_metadata.root_request_id` 由宿主的用户运行 ID 产生，同一运行的内部重试与 Agent 子模型调用继承，不使用跨用户多轮的 Generation Chain root。缺失或不安全时记录宿主告警，退化为本次推理操作的本地 root；不会把客户端新发起的 HTTP 请求自动归并为同一轮。
+- `operation_metadata.root_request_id` 由宿主的用户运行 ID 产生，同一运行的内部重试与 Agent 子模型调用继承，不使用跨用户多轮的 Generation Chain root。插件将它确定性映射为 `X-Root-Request-ID`，输出 32 位小写、无横线的 UUIDv7 位格式。缺失、空串或非字符串时告警，退化为本次推理操作新建的 UUIDv7 root；不会把客户端新发起的 HTTP 请求自动归并为同一轮。
+- `X-Conversation-ID` 只映射可信 `operation_metadata.session_affinity`，输出 36 字符带横线格式，不再原样发送宿主亲和键。缺失、空串或非字符串时省略会话头和 session baggage，不伪造会话关联；客户端 header 和 canonical session/request 参数不能覆盖该来源。
+- 稳定映射契约固定为 `SHA-256(b"stravia-workbuddy-id-v1\0" || 源 ID 的完整 UTF-8 字节)`，取前 16 字节，再设置 UUID version 为 `7`、variant 为 RFC 4122，最后按字段添加或省略横线。输入不裁剪、不改大小写、不限可见 ASCII；时间、随机数、设备和插件实例均不参与映射。相同源 ID 跨重试、子调用和插件重载得到相同 UUID 内容，无需持久映射表。例如 `user-run-a` 的 root 固定为 `c845b199d22c77b88bf012ecdc201766`。命名域、摘要算法及位布局是稳定身份契约，不能随意修改。该摘要只匹配 UUIDv7 外形，不表示真实创建时间，不是官方确定性映射算法，也不用于转换认证密钥、签名或令牌。
 - 宿主每个运行保存独立、未采样的 W3C 根传播上下文，经可信 `operation_metadata.traceparent` 传给插件；有效 `tracestate` 一同继承。插件为每次模型操作新建模型 span，内部免费→付费重试复用该 span，每个 HTTP 尝试另建子 span。B3 单头／多头表示模型 span，W3C 表示 HTTP span，采样位继承父上下文；WorkBuddy 的 B3 parent 扩展单独补充。宿主上下文缺失或无效时告警并新建推理级未采样 trace，不启动遥测导出，也不宣称完整复刻官方遥测。
-- `X-Request-ID` 与 `X-Conversation-Message-ID` 每次 HTTP 尝试共用一枚新 ID；`X-Conversation-Request-ID` 在同一次模型操作内稳定。`baggage` 使用真正的 conversation-request ID，而不是每次尝试的 message ID。`X-Conversation-ID` 仍只来自宿主会话亲和键。
+- `X-Request-ID` 与 `X-Conversation-Message-ID` 每次 HTTP 尝试共用一枚新 UUIDv7，输出 32 位小写、无横线格式；`X-Conversation-Request-ID` 为同格式的新 UUIDv7，在同一次模型操作和内部免费→付费切换中稳定，新模型操作重新生成。当前 SDK 没有提供这两类字段的独立可信源 ID，因此不挪用 root 或 session ID 生成它们，也不把客户端的 `parameters.session.request_id` 当作宿主 ID。`baggage` 的 session 和 conversation-request 值与对应头完全一致，不使用 message ID。
+- 上述默认形态来自 [WorkBuddy AI 5.8.4 客户端包](https://download.codebuddy.ai/workbuddy/saas/darwin-arm64/WorkBuddy-darwin-arm64-5.8.4.41366630-73952edb.zip)内嵌 CLI `2.161.0` 的 `SessionManager`、`generateConversationRequestId` 和 `buildConversationHeaders`。官方 session 校验并不强制 UUID，root 头也可继承非 UUID 字符串；conversation-request candidate 的客户端校验明确要求 32 位小写 UUIDv7 位格式。不能据此声称所有远端接口都强制 UUIDv7。认证、模型发现和额度路径保留既有请求 ID profile，trace/span 和真实 ACP 连接 ID 不参与这种转换。
 - ACP 头只接受宿主从真实 ACP 连接取得的 `operation_metadata.acp_connection_id`。当前直连宿主没有 ACP 连接生产者，因此省略并记宿主诊断；不生成随机连接 ID，不挪用 OAuth 连接 ID、传输亲和键或云任务连接 ID，本次不新增 ACP 通道。
 - 仅聊天 POST 通过 SDK 的 `GuestHost::http_start_with_compression(HttpRequest, HttpCompression)` 请求宿主压缩。Guest 始终传递原始 `application/json` 字节，不自行 gzip 或 Base64 编码；`HttpCompression.request` 默认选择 `Gzip`，官方元数据 `workbuddy_request_body_gzip` 明确为 `false` 时设为 `None`，不压缩请求。宿主负责 gzip、实际字节长度及相关传输头。响应 coding 列表保持为空（identity），本次不扩展上游响应压缩协商。认证、配置 GET 和额度 POST 不请求压缩。SDK / 宿主返回错误时按原错误处理，不回退或重新发送裸 JSON 请求。
 
@@ -207,12 +211,14 @@ npx --yes --ignore-scripts rea-agents@6.7.0 --help
 - 认证、配置、聊天与积分查询切换为新版客户端接口和区域身份；保留区域凭据隔离，移除旧国内计费 origin，不提供旧地址回退。
 - 额度查询改为单次资源包汇总，保留精确的小数积分，拒绝不完整数据；不再依赖旧资源列表分页或套餐名称。
 - 补充轮次 root、B3 单头及 parent 扩展，按模型／HTTP 分层传播 W3C 上下文；ACP 按真实连接来源处理，缺失不伪造。
+- 宿主 root/session ID 改为固定 SHA-256 派生的官方 UUIDv7 外形，分别输出 32/36 字符；模型操作与每次 HTTP 尝试的新 ID 改用真实 UUIDv7。首次切换会改变原先原样发送的上游身份，不能沿用旧会话身份；此后映射跨重载稳定。此改动对齐 ID 形态，不等于已解决原 debug 包中的低缓存命中率。
 - 产品身份取官方配置或默认 `SaaS`；聊天通过宿主 HTTP compression API 请求 gzip，Guest 只传原始 JSON，尊重官方显式关闭；传输头与长度由宿主管理，错误不触发裸请求重发。
 - 固定远端 Stravia dev 提交 `20c1291c142d5c19ba267552a6bfbdbb1c947bc6`，Rust workspace SDK crate 版本为 `0.5.2`、WIT ABI 为 `0.5.1`，构建工具链更新为 Rust `1.99.1`；canonical format 保持 `1`。须升级支持新 API 的宿主后重新构建并导入组件。
 - 聊天按真实账号条件生成企业 `X-Userinfo`，按产品配置生成 `X-Private-Data`，并补齐普通聊天 Agent 缺省；这些字段不进入发现或额度请求。保留请求上下文与重试生命周期，不接受客户端伪造身份，也不虚构缺少来源的 Agent、父会话或上下文压缩状态。
 - 聊天补齐上述八项固定 Windows/x64 SDK 兼容头；客户端和 operation metadata 无法覆盖，不放行未知 Stainless 字段或 helper/poll 头。免费与付费线路都以新的 SDK 请求计数，不改变宿主超时及压缩行为。
 - 本轮请求头对齐使用上述固定 SDK 和 Rust `1.99.1` 完成 release Wasm 构建，通过 30 项单元测试与 10 项真实 Wasm 组件契约。独立 TCP 冒烟加载同一组件，4 个场景、5 次真实 loopback 交换验证了企业／个人身份、隐私开关缺失和错误类型、客户端及 metadata 伪造过滤、八项固定 SDK 头唯一且无额外字段、免费／付费计数均为零，以及 Agent 普通缺省和请求与 trace 生命周期。此次头部冒烟显式关闭 gzip，仅使用合成凭据与本地服务，未调用真实上游。
 - SDK 迁移时另行验证的 loopback TCP 冒烟使用上游未修改的生产 HTTP 编码器：国内免费／付费请求均为单层 gzip，国际显式关闭后为原始 JSON；Unicode、产品快照、root/message 关联和单次 `UpstreamStarted` 均通过。宿主运行上下文的跨子执行根关联仍需同步构建宿主修改；设备令牌不包含原生 SDK 集成。
+- 本次 ID 映射更新先确认旧组件原样发送 root 的回归契约失败，再通过 30 项单元测试和全部 10 项 Wasm 组件契约。独立程序加载本次国际版 Wasm，以测试用 TCP adapter 完成 10 个场景、11 次真实 loopback HTTP 交换，验证免费→付费、子调用与重载稳定性、不同会话隔离、UTF-8/CRLF/NUL 源 ID、空值／错误类型／缺失元数据，以及 header/baggage 关联。仅使用合成凭据、本地服务并显式关闭 gzip；这次冒烟没有运行生产 HTTP encoder，也没有调用真实上游或重新测量缓存命中率。
 
 ## v0.2.1 升级说明
 
