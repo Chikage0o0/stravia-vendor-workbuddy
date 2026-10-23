@@ -73,7 +73,7 @@ impl Region {
     pub(crate) fn user_agent(self) -> &'static str {
         match self {
             Self::Cn => "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0",
-            Self::Intl => "WorkBuddy/5.8.4 WorkBuddy AI/5.8.4 CLI/2.161.0",
+            Self::Intl => "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0",
         }
     }
 }

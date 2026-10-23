@@ -512,6 +512,13 @@ fn retain_cli_body(body: &mut Value) {
             retain_fields(tool, &["type", "function"]);
             if let Some(function) = tool.get_mut("function") {
                 retain_fields(function, &["name", "description", "parameters", "strict"]);
+                // 国内/国际官方 BaseTool 均显式关闭 strict；国际 DeepSeek 的原工具集
+                // 在严格模式下持续低缓存命中，故对齐默认值，不修改参数 Schema 或输出格式。
+                if let Some(strict) = function.get_mut("strict") {
+                    *strict = Value::Bool(false);
+                } else if let Some(function) = function.as_object_mut() {
+                    function.insert("strict".into(), Value::Bool(false));
+                }
             }
         }
     }
@@ -1446,7 +1453,7 @@ mod tests {
         );
         assert_eq!(
             body["tools"][0],
-            json!({"type":"function", "function":{"name":"lookup", "parameters":schema, "strict":true}})
+            json!({"type":"function", "function":{"name":"lookup", "parameters":schema, "strict":false}})
         );
         assert_eq!(
             body["response_format"],

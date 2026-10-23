@@ -76,14 +76,18 @@ API Key:  由 Stravia 访问控制配置决定
 
 ### 已验证的账号状态
 
-2026-10-22 使用本机真实凭据分别查询两区 `/v3/config`，均为 HTTP 200 / `code: 0`：
+2026-10-22 使用本机真实凭据和插件的完整配置请求身份头查询两区 `/v3/config`，均为 HTTP 200 / `code: 0`。本次复核使用修正后的国际版 `workbuddy-ai` 应用身份；国内 UA 保持不变。下表计数是上游原始 `models` 数组长度，不是按默认 agent 筛选后的同步模型数量：
 
-| 区域 | 账号目录 | 授权范围内的单次真实生图 |
-|------|----------|------------------------|
-| 国内 | 37 个模型，`hunyuan-image-v3.0-art` 带 `text-to-image` 标签 | HTTP 200 / `code: 0`；从上述 COS 域下载并解码为 1024×1024 PNG，上游报告 `credit: 5.71` |
-| 国际 | 28 个模型，无生图标签 | 官方静态模型 `gpt-image-2.5-sunburst` 返回 HTTP 400 / `14401`，提示模型路由不存在；不将它硬编码为可用模型 |
+| 区域 | 原始目录 | 生图模型 |
+|------|----------|----------|
+| 国内 | 62 条 | `hunyuan-image-alpha`：`text-to-image`；`hunyuan-image-alpha-edit`：`image-to-image` |
+| 国际 | 28 条 | 当前账号没有返回生图标签模型 |
 
-这证明国内账号的接口与产物格式，不承诺其他账号的权限、价格或模型尺寸。国际操作入口已实现，但当前实测账号没有可用生图模型；重新同步后只展示上游实际开放的模型。两区各只发起一次真实生图，没有自动重试。真实 API 核验使用直接请求，不等同于已在用户宿主中导入并完成线上端到端调用。
+国内宿主实际同步记录中的两个 Alpha 模型均来自 `cn` 的 `account-config`，状态为 `present`。文生图模型声明文字输入、图片输出；Edit 模型另声明图片输入，与上游标签一致。它们不是插件对 `hunyuan-image-v3.0-art` 的重命名，也不是需要移除的静态占位模型。
+
+**模型目录对 User-Agent 敏感，不能用简化身份的直连结果替代实际同步。** 同一国内账号、同一端点的单变量对照确认：`User-Agent: WorkBuddy/5.8.3` 返回 37 条目录和 `hunyuan-image-v3.0-art`；只把该字段改为插件实际使用的 `WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0`，就返回上述完整目录和两个 Alpha 模型。分别单独增加 `X-Requested-With`、Origin、Referer、Accept-Language、Accept 或 Content-Type，均不会切换到 Alpha 目录。独立诊断须保留完整身份头，不得手工简化 UA，也不应把不同身份返回的模型 ID 硬编码进发现逻辑。
+
+早期已授权的国内单次出图使用了简化 UA 和 `hunyuan-image-v3.0-art`，得到 HTTP 200 / `code: 0`、1024×1024 PNG，上游报告 `credit: 5.71`；国际静态模型 `gpt-image-2.5-sunburst` 在该轮请求中返回 HTTP 400 / `14401`。这些历史结果只证明当时请求身份与模型对应的接口行为，**不能证明完整插件身份下两个 Alpha 模型已完成真实出图验证**。本轮目录纠正只执行配置 GET，没有再次发起生图或消耗生图积分；不承诺其他账号的权限、价格、模型尺寸或实时可用性。
 
 已发布 v0.3.0 的 Wasm 另通过 36 项单元测试、11 项真实组件契约，以及独立程序的 7 个场景、8 次真实 loopback TCP 交换。回放使用脱敏后的真实目录和国内生成的 PNG、合成凭据，验证两区发现、URL 下载、Base64 文生图、参考图、尺寸映射、上游错误不重试及未批准 URL 拒绝；不把国际离线成功响应当作线上出图成功。组件契约同时检查下载不泄露凭据和跨区域凭据在出站前被拒绝。此次正则变更仅使用合成凭据、本地网络与隔离数据库验证，没有再次发起真实生图。
 
@@ -114,7 +118,7 @@ API Key:  由 Stravia 访问控制配置决定
 - `stream_options` 只保留 `include_usage`。
 - `thinking` 只保留 `type`、`clear_thinking`；`reasoning` 只保留 `effort`、`enabled`；`chat_template_kwargs` 只保留 `enable_thinking`、`preserve_thinking`。
 - 消息只保留角色、内容、名称、工具调用及结果关联、推理文本、音频引用和已知扩展结构。内容块仅保留文本、拒绝文本、图片、音频、文件及缓存控制的协议字段；Google `thought_signature` 与 `extra_fields._meta` 数据保留。
-- function 工具只保留 `name`、`description`、`parameters`、`strict`；工具调用只保留 ID、类型、函数名、arguments 和已知 Google 签名结构。
+- function 工具只保留 `name`、`description`、`parameters`、`strict`，其中 `strict` 在国内／国际版均统一为 `false`（包括覆盖显式 `true`）；工具调用只保留 ID、类型、函数名、arguments 和已知 Google 签名结构。
 - `response_format` 只保留 `type`、`json_schema`；`json_schema` 只保留 `name`、`strict`、`schema`。
 - **不递归过滤用户数据**：提示词、工具结果文本、工具 `arguments`、工具 JSON Schema / 输出 JSON Schema 内的属性名、默认值和自定义 schema 关键字保持原样。
 
@@ -140,7 +144,16 @@ API Key:  由 Stravia 访问控制配置决定
 
 官方版本变化不会自动放开新参数，须重新核对发行包并更新白名单。
 
+工具严格模式另按国内 WorkBuddy、国际 WorkBuddy AI 的实际安装包所带 CLI 核对：两版 `BaseTool` 均默认 `strict:false`，SDK 工具构造与 OpenAI 转换保留并发送该值，并非省略字段。国际 DeepSeek 原始复杂工具集在 `strict:true` 时持续低缓存命中；真实 WASM 对照仅修改工具 `strict` 后，两区重复请求均恢复高命中。这不表示所有模型或所有严格工具都不能缓存，也不保证首次请求命中。工具参数 JSON Schema 与输出 `response_format.json_schema.strict` 保持原样；工具定义不再提供服务端 `strict:true` 的强约束，调用方仍须校验工具参数。
+
 当前客户端身份按区域的官方稳定更新 API 与实际桌面发布包核实：国内 WorkBuddy `5.8.3`、国际 WorkBuddy AI `5.8.4`，两者内嵌 CLI 均为 `2.161.0`。产品版本同步用于 `X-IDE-Version` 和 User-Agent。来源：[国内更新 API](https://www.workbuddy.cn/v2/update?platform=workbuddy-darwin-arm64)、[国际更新 API](https://www.workbuddy.ai/v2/update?platform=workbuddy-darwin-arm64)。独立 npm CLI 的 latest 版本不是桌面应用的内嵌 CLI，不能直接替代其身份字段；上面的白名单引用仍保留其原始核对版本。
+
+模型发现、聊天和图片请求使用完整 CLI UA。官方 `buildUserAgent()` 优先选择 `applicationName`，为空才使用 `productName`，因此国际版不能用产品展示名 `WorkBuddy AI` 替代应用名 `workbuddy-ai`：
+
+- 国内：`WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0`。
+- 国际：`WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`。
+
+认证和额度接口继续使用各自的轻量产品 UA，不受本次修正影响。
 
 ### 聊天请求头生成规则
 
@@ -252,6 +265,8 @@ npx --yes --ignore-scripts rea-agents@6.7.0 --help
 
 ## 未发布变更
 
+- 国内／国际 function 工具统一发送 `strict:false`，对齐官方 `BaseTool` 默认值；不修改参数 Schema、输出格式的严格模式或缓存用量统计。新旧真实 WASM 与两区真实凭据对照已验证重复请求的缓存恢复，上游原始 SSE、canonical、下游计数一致。
+- 国际版完整 CLI UA 的应用段由产品展示名改为官方 `applicationName`；国内身份不变。两区真实账号的只读配置请求均成功，账号目录见[已验证的账号状态](#已验证的账号状态)。
 - COS 图片下载权限由单一固定桶改为上述完整主机正则，支持不同桶和 COS 区域；HTTPS／443、默认拒绝及无凭据下载约束不变。
 - 需要先升级宿主，再使用支持该契约的 SDK 构建、导入插件。新宿主保留旧插件加载及精确授权语义；实物 v0.2.2、已发布 v0.3.0 已在隔离实例验证加载、安装与数据库重开。
 - 当前源码和本地构建与已发布 v0.3.0 的原始 artifact 不同；未重发或修改既有 release。
