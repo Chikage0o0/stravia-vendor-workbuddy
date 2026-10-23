@@ -231,9 +231,9 @@ Node 版本选择已安装 WorkBuddy 所用 Electron `37.10.3` 对应的 Node `2
 
 ## 自行构建
 
-当前源码使用插件目录旁的完整 `StraviaPlatform/` checkout，五个 Stravia 依赖统一指向 `../StraviaPlatform/backend/crates/...`；不能只下载本插件源码。此未发布变更要求该 checkout 包含 SDK 的 `OriginHost` 和 Core 的主机正则权限实现，不能只按 crate 版本号判断兼容性。
+当前源码使用插件目录旁的完整 `StraviaPlatform/` checkout，五个 Stravia 依赖统一指向 `../StraviaPlatform/backend/crates/...`；不能只下载本插件源码。v0.3.1 要求该 checkout 包含 SDK 的 `OriginHost` 和 Core 的主机正则权限实现，不能只按 crate 版本号判断兼容性。
 
-发布工作流按同一目录关系检出到 `source/StraviaPlatform`；现有 `STRAVIA_PLATFORM_REF` 仓库变量可指定固定 revision。工作流默认的 [`20c1291c142d5c19ba267552a6bfbdbb1c947bc6`](https://github.com/Stravia-AI/StraviaPlatform/commit/20c1291c142d5c19ba267552a6bfbdbb1c947bc6) 是已发布 v0.3.0 的依赖基线，不含此新契约；发布正则版本前，必须先合入宿主变更，再将该变量设为包含变更的固定提交。覆盖变量后须核对 SDK、protocol-codec 和 vendor-runtime 契约，并通过构建与真实组件验证。Rust workspace crate 版本与 WIT ABI 包版本是两套版本号，本次不改变 `stravia:vendor@0.5.1`。
+发布工作流按同一目录关系检出到 `source/StraviaPlatform`，默认固定到 [`d99b57b8da2506de2cb96c66bc1f7d73d136e095`](https://github.com/Stravia-AI/StraviaPlatform/commit/d99b57b8da2506de2cb96c66bc1f7d73d136e095)，包含主机正则权限契约。现有 `STRAVIA_PLATFORM_REF` 仓库变量可指定其他固定 revision；覆盖后须核对 SDK、protocol-codec 和 vendor-runtime 契约，并通过构建与真实组件验证。Rust workspace crate 版本与 WIT ABI 包版本是两套版本号，本次不改变 `stravia:vendor@0.5.1`。
 
 `assets/workbuddy.svg` 使用 [WorkBuddy 官方 SVG](https://download.codebuddy.ai/web/workbuddy/f5bce0c03cdc17fa28d25634fb48d2791c297da3/assets/logo.svg) 的原始 mascot 和双眼几何，去掉背景、渐变及模糊，编译进 Wasm 为透明单色图标。显示需要更新后的 Stravia 宿主并重新导入插件，不在运行时下载品牌资源。图标归属和使用限制见 [NOTICE](NOTICE)。
 
@@ -263,13 +263,14 @@ npx --yes --ignore-scripts rea-agents@6.7.0 --help
 
 启动配置使用 `--ignore-scripts`，避免可选 Frida 依赖的原生安装脚本阻塞下载。Frida 原生绑定不在本次安装范围内；需要动态插桩时须单独完成安装。原生反编译还需自行配置 Ghidra 或 IDA 等分析引擎；注册 MCP 不代表所有分析后端均已就绪。
 
-## 未发布变更
+## v0.3.1 升级说明
 
 - 国内／国际 function 工具统一发送 `strict:false`，对齐官方 `BaseTool` 默认值；不修改参数 Schema、输出格式的严格模式或缓存用量统计。新旧真实 WASM 与两区真实凭据对照已验证重复请求的缓存恢复，上游原始 SSE、canonical、下游计数一致。
 - 国际版完整 CLI UA 的应用段由产品展示名改为官方 `applicationName`；国内身份不变。两区真实账号的只读配置请求均成功，账号目录见[已验证的账号状态](#已验证的账号状态)。
 - COS 图片下载权限由单一固定桶改为上述完整主机正则，支持不同桶和 COS 区域；HTTPS／443、默认拒绝及无凭据下载约束不变。
 - 需要先升级宿主，再使用支持该契约的 SDK 构建、导入插件。新宿主保留旧插件加载及精确授权语义；实物 v0.2.2、已发布 v0.3.0 已在隔离实例验证加载、安装与数据库重开。
-- 当前源码和本地构建与已发布 v0.3.0 的原始 artifact 不同；未重发或修改既有 release。
+- 构建依赖固定到上述宿主提交；v0.3.0 的原始 artifact 和既有 Release 保持不变。
+- Rust `1.99.1` 构建通过，36 项单元测试与 11 项真实 Wasm 组件契约通过。独立程序加载 v0.3.1 组件，以合成凭据完成 CN／Intl 两次真实 loopback TCP 推理，确认 `strict:false`、工具 Schema 保留、区域 UA、canonical 响应与 token 计量；该冒烟使用发送原始 JSON 的本地传输适配器，未验证生产 HTTP encoder 的 gzip，也未调用真实上游或重新测量缓存命中率。
 
 ## v0.3.0 升级说明
 
@@ -317,8 +318,8 @@ npx --yes --ignore-scripts rea-agents@6.7.0 --help
 版本号以 `Cargo.toml` 的 `version` 为准。同步更新 `Cargo.lock` 中本插件的版本，运行 `task verify`，提交版本变更并推送后，打 tag 触发 GitHub Action 构建并发布 Release：
 
 ```bash
-git tag -a v0.3.0 -m "发布 v0.3.0"
-git push origin v0.3.0
+git tag -a v0.3.1 -m "发布 v0.3.1"
+git push origin v0.3.1
 ```
 
 tag 的 `v` 前缀版本号必须与 `Cargo.toml` 一致，否则 workflow 拒绝发布。Release 附件包含 `stravia-vendor-workbuddy-v<版本>.wasm`、`SHA256SUMS`、`LICENSE`、`NOTICE` 及第三方组件许可证。
