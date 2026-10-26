@@ -917,20 +917,45 @@ async fn regional_allowance_contract() {
             provider: provider.clone(),
             request: AllowanceRequest::default(),
         };
+        let account_response = |account: Value| {
+            let data = if region == "cn" {
+                account
+            } else {
+                json!({"accounts":[
+                    {"uid":"other-account","enterpriseId":"quota-tenant","email":"other@example.test"},
+                    account
+                ]})
+            };
+            Reply::json(json!({"code":0,"data":data}))
+        };
         local.reply(Reply::json(summary_response(vec![
             json!({
-                "CycleTotalCapacity":500, "CycleRemainCapacity":"334.16", "CycleUsedCapacity":"165.84"
+                "CycleTotalCapacity":500, "CycleRemainCapacity":"334.16", "CycleUsedCapacity":"165.84",
+                "SubscriptionPackageName":"Resource bucket, not a verified account subscription"
             }),
             json!({
                 "CycleTotalCapacity":4481, "CycleRemainCapacity":4481, "CycleUsedCapacity":0
             }),
         ])));
+        local.reply(account_response(json!({
+            "uid":"quota-account","enterpriseId":"quota-tenant",
+            "email":" quota@example.test ","nickname":"配额昵称"
+        })));
         let output = run(&runtime, &plugin, region, input(), local.scope())
             .await
             .unwrap();
         let OperationOutput::Allowance(result) = output else {
             panic!("expected allowance result")
         };
+        assert_eq!(
+            result.account_label.as_deref(),
+            Some("quota@example.test"),
+            "the matching account's readable email must be preferred over its nickname"
+        );
+        assert_eq!(
+            result.plan_label, None,
+            "a billing resource package name must not be mistaken for a subscription tier"
+        );
         assert_eq!(result.allowances.len(), 1);
         assert_eq!(
             result.allowances[0].remaining.as_ref().unwrap().value,
@@ -951,7 +976,7 @@ async fn regional_allowance_contract() {
         );
         {
             let requests = local.requests.lock();
-            let request = requests.last().unwrap();
+            let request = &requests[0];
             assert_eq!(
                 request.url,
                 format!("{origin}/billing/meter/get-user-resource-summary")
@@ -972,6 +997,76 @@ async fn regional_allowance_contract() {
                     .iter()
                     .any(|(key, _)| key.eq_ignore_ascii_case("x-ide-type"))
             );
+            let profile = &requests[1];
+            assert_eq!(profile.method, "GET");
+            assert_eq!(
+                profile.url,
+                format!(
+                    "{origin}/v2/plugin/{}",
+                    if region == "cn" {
+                        "account"
+                    } else {
+                        "accounts"
+                    }
+                )
+            );
+            assert!(profile.body.is_empty());
+            assert_no_chat_identity_headers(profile);
+            assert_eq!(request_header(profile, "x-domain"), Some(domain));
+            assert_eq!(
+                request_header(profile, "x-enterprise-id"),
+                Some("quota-tenant")
+            );
+        }
+
+        for (account, expected) in [
+            (
+                json!({"uid":"quota-account","enterpriseId":"quota-tenant","email":" ","nickname":" 配额昵称 "}),
+                Some("配额昵称"),
+            ),
+            (
+                json!({"uid":"other-account","enterpriseId":"quota-tenant","email":"other@example.test"}),
+                None,
+            ),
+            (
+                json!({"uid":"quota-account","enterpriseId":"other-tenant","nickname":"Other tenant"}),
+                None,
+            ),
+            (
+                json!({"uid":"quota-account","enterpriseId":"quota-tenant","nickname":" ","uin":"opaque-id","phoneNumber":"123456789"}),
+                None,
+            ),
+        ] {
+            local.reply(Reply::json(summary_response(vec![json!({
+                "CycleTotalCapacity":10,"CycleRemainCapacity":7,"CycleUsedCapacity":3
+            })])));
+            local.reply(account_response(account));
+            let output = run(&runtime, &plugin, region, input(), local.scope())
+                .await
+                .unwrap();
+            let OperationOutput::Allowance(result) = output else {
+                panic!("expected allowance result")
+            };
+            assert_eq!(result.account_label.as_deref(), expected);
+            assert_eq!(result.allowances[0].remaining.as_ref().unwrap().value, "7");
+        }
+
+        if region == "intl" {
+            local.reply(Reply::json(summary_response(Vec::new())));
+            local.reply(Reply::json(json!({"code":0,"data":{"accounts":[
+                {"uid":"quota-account","enterpriseId":"quota-tenant","nickname":"First"},
+                {"uid":"quota-account","enterpriseId":"quota-tenant","nickname":"Second"}
+            ]}})));
+            let output = run(&runtime, &plugin, region, input(), local.scope())
+                .await
+                .unwrap();
+            let OperationOutput::Allowance(result) = output else {
+                panic!("expected allowance result")
+            };
+            assert_eq!(
+                result.account_label, None,
+                "ambiguous profiles must not pick the first account"
+            );
         }
 
         local.reply(Reply::json(summary_response(vec![
@@ -986,6 +1081,11 @@ async fn regional_allowance_contract() {
         );
 
         local.reply(Reply::json(summary_response(Vec::new())));
+        local.reply(Reply {
+            status: 503,
+            headers: vec![("content-type".into(), "application/json".into())],
+            chunks: Mutex::new(VecDeque::from([b"{}".to_vec()])),
+        });
         let output = run(&runtime, &plugin, region, input(), local.scope())
             .await
             .unwrap();
@@ -995,6 +1095,22 @@ async fn regional_allowance_contract() {
         assert_eq!(result.allowances[0].remaining.as_ref().unwrap().value, "0");
         assert_eq!(result.allowances[0].used.as_ref().unwrap().value, "0");
         assert_eq!(result.allowances[0].limit.as_ref().unwrap().value, "0");
+        assert_eq!(
+            result.account_label, None,
+            "a failed optional profile must not fail the credit refresh"
+        );
+
+        local.reply(Reply::json(summary_response(Vec::new())));
+        local.reply(Reply::json(
+            json!({"code":123,"data":{"nickname":"do-not-display"}}),
+        ));
+        let output = run(&runtime, &plugin, region, input(), local.scope())
+            .await
+            .unwrap();
+        let OperationOutput::Allowance(result) = output else {
+            panic!("expected allowance without a profile")
+        };
+        assert_eq!(result.account_label, None);
 
         local.reply(Reply::json(json!({"code":123,"msg":"do-not-echo"})));
         let error = run(&runtime, &plugin, region, input(), local.scope())
@@ -1050,7 +1166,7 @@ async fn regional_allowance_contract() {
         );
         assert!(local.replies.lock().is_empty());
         println!(
-            "{region}: summary credit totals, decimal usage, incomplete-package rejection, zero balance, upstream failures and credential isolation passed"
+            "{region}: summary credit totals, readable account selection, account/tenant isolation, optional profile failures, incomplete-package rejection and upstream failures passed"
         );
     }
 }

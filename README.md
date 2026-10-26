@@ -211,6 +211,7 @@ Node 版本选择已安装 WorkBuddy 所用 Electron `37.10.3` 对应的 Node `2
 - 令牌刷新：`POST /v2/plugin/auth/token/refresh`，两个区域均发送 `X-Auth-Refresh-Source: plugin`。
 - 模型配置：`GET /v3/config`；聊天：`POST /v2/chat/completions`。
 - 积分汇总：`POST /billing/meter/get-user-resource-summary`，请求体为 `{}`；对 `data.Packages` 中的 `CycleTotalCapacity`、`CycleRemainCapacity`、`CycleUsedCapacity` 做十进制精确求和。接口不分页；缺失或非法的周期额度字段会导致查询失败，不返回部分余额。请求发送桌面产品 User-Agent、`X-Request-ID`、账号与企业身份头，不再使用旧计费信封。
+- 账号资料：额度主查询成功后，国内追加 `GET /v2/plugin/account`，国际追加 `GET /v2/plugin/accounts`；沿用所选区域的 Bearer 凭据和配置查询身份头，不使用浏览器 Cookie。只采用唯一匹配当前 `uid` 与 `enterpriseId` 的账号，优先非空 `email`，其次 `nickname`。列表首项、其他账号／企业、歧义、UID 和电话号码均不能作为展示回退。资料请求失败或没有可读字段时省略账号，不影响已取得的积分；不重试、不保存额外凭据。
 
 插件不再声明旧国内计费域，也不接受旧国内 base URL；配置响应中的 `data.endpoint` 不会改变固定目的地或扩大网络权限。升级后须重新导入插件，把已有国内连接的 base URL 改为 `https://www.workbuddy.cn`，并重新同步模型。
 
@@ -231,9 +232,9 @@ Node 版本选择已安装 WorkBuddy 所用 Electron `37.10.3` 对应的 Node `2
 
 ## 自行构建
 
-当前源码使用插件目录旁的完整 `StraviaPlatform/` checkout，五个 Stravia 依赖统一指向 `../StraviaPlatform/backend/crates/...`；不能只下载本插件源码。v0.3.1 要求该 checkout 包含 SDK 的 `OriginHost` 和 Core 的主机正则权限实现，不能只按 crate 版本号判断兼容性。
+当前源码使用插件目录旁的完整 `StraviaPlatform/` checkout，五个 Stravia 依赖统一指向 `../StraviaPlatform/backend/crates/...`；不能只下载本插件源码。v0.3.2 使用 SDK `0.5.3` 的额度响应契约，并延续 SDK `OriginHost` 与 Core 主机正则权限实现要求，不能只按 crate 版本号判断兼容性。
 
-发布工作流按同一目录关系检出到 `source/StraviaPlatform`，默认固定到 [`d99b57b8da2506de2cb96c66bc1f7d73d136e095`](https://github.com/Stravia-AI/StraviaPlatform/commit/d99b57b8da2506de2cb96c66bc1f7d73d136e095)，包含主机正则权限契约。现有 `STRAVIA_PLATFORM_REF` 仓库变量可指定其他固定 revision；覆盖后须核对 SDK、protocol-codec 和 vendor-runtime 契约，并通过构建与真实组件验证。Rust workspace crate 版本与 WIT ABI 包版本是两套版本号，本次不改变 `stravia:vendor@0.5.1`。
+发布工作流按同一目录关系检出到 `source/StraviaPlatform`，默认固定到 [`4b41929ea60e2ef3be31b3f410f18225435d75db`](https://github.com/Stravia-AI/StraviaPlatform/commit/4b41929ea60e2ef3be31b3f410f18225435d75db)，包含插件来源展示、无目录供应商筛选标签修复及新版额度账号／套餐展示契约。现有 `STRAVIA_PLATFORM_REF` 仓库变量可指定其他固定 revision；覆盖后须核对 SDK、protocol-codec 和 vendor-runtime 契约，并通过构建与真实组件验证。Rust workspace crate 版本与 WIT ABI 包版本是两套版本号，本次不改变 `stravia:vendor@0.5.1`。
 
 `assets/workbuddy.svg` 使用 [WorkBuddy 官方 SVG](https://download.codebuddy.ai/web/workbuddy/f5bce0c03cdc17fa28d25634fb48d2791c297da3/assets/logo.svg) 的原始 mascot 和双眼几何，去掉背景、渐变及模糊，编译进 Wasm 为透明单色图标。显示需要更新后的 Stravia 宿主并重新导入插件，不在运行时下载品牌资源。图标归属和使用限制见 [NOTICE](NOTICE)。
 
@@ -263,13 +264,23 @@ npx --yes --ignore-scripts rea-agents@6.7.0 --help
 
 启动配置使用 `--ignore-scripts`，避免可选 Frida 依赖的原生安装脚本阻塞下载。Frida 原生绑定不在本次安装范围内；需要动态插桩时须单独完成安装。原生反编译还需自行配置 Ghidra 或 IDA 等分析引擎；注册 MCP 不代表所有分析后端均已就绪。
 
+## v0.3.2 升级说明
+
+- 五个 Stravia 路径依赖与锁文件同步到上述 `dev` 固定提交的 `0.5.3`；额度响应显式提供可选 `account_label`。canonical format、WIT、认证凭据、连接配置和出站权限不变。
+- 插件来源标签、来源搜索和无目录供应商的额度类型筛选由宿主实现，需要同步升级 Stravia Core／WebUI；只重新导入 Wasm 不会更新宿主界面。WorkBuddy 保留 `Dedicated`、独立 `provider_id`、空 `catalog_id` 与内嵌 SVG，不伪造官方内置来源或其他品牌目录关联。
+- 账号展示接入上述官方插件资料接口，邮箱优先、昵称兜底；更新后重新导入插件并刷新额度即可，无需重新登录。接口和认证方式分别对照国内 WorkBuddy `5.8.3` 的 `AccountScopedExternalLinkAuthenticationProvider.fetchCurrentAccount`、国际 WorkBuddy AI `5.8.4` 的 `getAccountSnapshot` 及内嵌产品配置核实，不将网页 Cookie 资料入口误认为唯一来源。
+- 2026-10-23 使用用户授权的部署凭据执行三次只读资料 GET：国内一个连接、国际两个连接均为 HTTP 200／`code: 0`，返回账号与当前凭据唯一匹配，三个账号均返回 `nickname`，均没有返回 `email`。这证明昵称可取，不承诺每个账号都有邮箱。凭据留在远程进程中使用，没有打印、复制或写回数据库；没有调用聊天、生图或消耗积分。
+- 套餐仍只接受已确认的真实订阅等级，`plan_label` 保持为空；不把产品名、企业 ID、积分量或 `SubscriptionPackageName` 资源包名用于套餐展示。
+- 对照 Antigravity 的修复：它通过 `paidTier.name` 而不是 `currentTier.name` 产品名读取订阅，附加查询失败不阻断额度刷新；这些字段和 `agent/UUID`、原生 session 格式属于 Antigravity，不移植到 WorkBuddy。WorkBuddy 既有 UUIDv7 外形映射、流式终态和 `6004` 免费→付费切换保持不变。
+- 先通过真实 Wasm 契约复现旧组件的账号标签为空，再完成 Rust `1.99.1` release Wasm 构建、36 项单元测试和 11 项组件契约；覆盖邮箱优先、Unicode 昵称、账号／企业隔离、列表歧义、资料失败降级与积分精度。独立程序加载新 Wasm，以合成凭据完成三个场景、六次真实 loopback TCP 交换，验证国内昵称、国际邮箱及资料 HTTP 503 时积分仍成功返回。Wasm 验证未使用真实凭据，线上三次 GET 另由远程只读诊断程序执行；没有验证管理页面的视觉效果。
+
 ## v0.3.1 升级说明
 
 - 国内／国际 function 工具统一发送 `strict:false`，对齐官方 `BaseTool` 默认值；不修改参数 Schema、输出格式的严格模式或缓存用量统计。新旧真实 WASM 与两区真实凭据对照已验证重复请求的缓存恢复，上游原始 SSE、canonical、下游计数一致。
 - 国际版完整 CLI UA 的应用段由产品展示名改为官方 `applicationName`；国内身份不变。两区真实账号的只读配置请求均成功，账号目录见[已验证的账号状态](#已验证的账号状态)。
 - COS 图片下载权限由单一固定桶改为上述完整主机正则，支持不同桶和 COS 区域；HTTPS／443、默认拒绝及无凭据下载约束不变。
 - 需要先升级宿主，再使用支持该契约的 SDK 构建、导入插件。新宿主保留旧插件加载及精确授权语义；实物 v0.2.2、已发布 v0.3.0 已在隔离实例验证加载、安装与数据库重开。
-- 构建依赖固定到上述宿主提交；v0.3.0 的原始 artifact 和既有 Release 保持不变。
+- v0.3.1 构建依赖固定到 [`d99b57b8da2506de2cb96c66bc1f7d73d136e095`](https://github.com/Stravia-AI/StraviaPlatform/commit/d99b57b8da2506de2cb96c66bc1f7d73d136e095)；v0.3.0 的原始 artifact 和既有 Release 保持不变。
 - Rust `1.99.1` 构建通过，36 项单元测试与 11 项真实 Wasm 组件契约通过。独立程序加载 v0.3.1 组件，以合成凭据完成 CN／Intl 两次真实 loopback TCP 推理，确认 `strict:false`、工具 Schema 保留、区域 UA、canonical 响应与 token 计量；该冒烟使用发送原始 JSON 的本地传输适配器，未验证生产 HTTP encoder 的 gzip，也未调用真实上游或重新测量缓存命中率。
 
 ## v0.3.0 升级说明
@@ -318,8 +329,8 @@ npx --yes --ignore-scripts rea-agents@6.7.0 --help
 版本号以 `Cargo.toml` 的 `version` 为准。同步更新 `Cargo.lock` 中本插件的版本，运行 `task verify`，提交版本变更并推送后，打 tag 触发 GitHub Action 构建并发布 Release：
 
 ```bash
-git tag -a v0.3.1 -m "发布 v0.3.1"
-git push origin v0.3.1
+git tag -a v0.3.2 -m "发布 v0.3.2"
+git push origin v0.3.2
 ```
 
 tag 的 `v` 前缀版本号必须与 `Cargo.toml` 一致，否则 workflow 拒绝发布。Release 附件包含 `stravia-vendor-workbuddy-v<版本>.wasm`、`SHA256SUMS`、`LICENSE`、`NOTICE` 及第三方组件许可证。

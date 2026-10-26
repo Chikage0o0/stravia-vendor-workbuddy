@@ -1,8 +1,8 @@
 use rust_decimal::Decimal;
 use serde_json::Value;
-use stravia_vendor_common::common;
+use stravia_vendor_common::{account::first_account_label, common};
 use stravia_vendor_sdk::{
-    AllowanceAmount, AllowanceItem, AllowanceResponse, ErrorKind, GuestHost, HttpRequest,
+    AllowanceAmount, AllowanceItem, AllowanceResponse, ErrorKind, GuestHost, HttpRequest, LogLevel,
     PluginError, ProviderSnapshot, read_http_body,
 };
 
@@ -36,11 +36,78 @@ pub(crate) fn execute(
     for row in packages(&value)? {
         totals.include(package(row)?)?;
     }
+    // 资料只是附加展示；读取失败不能抹掉已经成功取得的积分。
+    let account_label = load_account_label(host, provider, region).unwrap_or_else(|_| {
+        host.log(LogLevel::Warn, "WorkBuddy account profile is unavailable");
+        None
+    });
     Ok(AllowanceResponse {
         allowances: vec![totals.into_allowance(region)],
         models: Vec::new(),
+        // 资源包名不是已确认的订阅等级，不据此推断套餐。
         plan_label: None,
+        account_label,
     })
+}
+
+fn load_account_label(
+    host: &GuestHost,
+    provider: &ProviderSnapshot,
+    region: Region,
+) -> Result<Option<String>, PluginError> {
+    let path = match region {
+        Region::Cn => "/v2/plugin/account",
+        Region::Intl => "/v2/plugin/accounts",
+    };
+    let response = host.http_start(HttpRequest {
+        method: "GET".into(),
+        url: format!("{}{path}", region.origin()),
+        headers: auth::headers(provider, region)?,
+        body: Vec::new(),
+    })?;
+    let status = response.status()?;
+    if !(200..300).contains(&status) {
+        return Err(malformed("WorkBuddy account profile HTTP request failed"));
+    }
+    let bytes = read_http_body(&response, MAX_BODY_BYTES)?;
+    let value: Value =
+        serde_json::from_slice(&bytes).map_err(|_| malformed("invalid account profile JSON"))?;
+    if value.get("code").and_then(Value::as_i64) != Some(0) {
+        return Err(malformed(
+            "WorkBuddy account service rejected the profile query",
+        ));
+    }
+    Ok(account_label(&value, provider, region))
+}
+
+fn account_label(value: &Value, provider: &ProviderSnapshot, region: Region) -> Option<String> {
+    let uid = provider.credentials.get("uid")?.as_str()?.trim();
+    let enterprise_id = provider
+        .credentials
+        .get("enterprise_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let data = value.get("data")?;
+    let accounts = match region {
+        Region::Cn => std::slice::from_ref(data),
+        Region::Intl => data.get("accounts")?.as_array()?.as_slice(),
+    };
+    let mut matching = accounts.iter().filter(|account| {
+        let account_enterprise_id = match account.get("enterpriseId") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) => Some(id.as_str()).filter(|id| !id.is_empty()),
+            _ => return false,
+        };
+        account.get("uid").and_then(Value::as_str) == Some(uid)
+            && account_enterprise_id == enterprise_id
+    });
+    let account = matching.next()?;
+    // 列表顺序不是账号身份；歧义时宁可不显示，也不选其他账号或企业。
+    if matching.next().is_some() {
+        return None;
+    }
+    first_account_label(["email", "nickname"].map(|key| account.get(key).and_then(Value::as_str)))
 }
 
 fn packages(value: &Value) -> Result<&[Value], PluginError> {
