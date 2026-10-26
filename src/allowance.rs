@@ -1,9 +1,10 @@
 use rust_decimal::Decimal;
 use serde_json::Value;
-use stravia_vendor_common::{account::first_account_label, common};
+use stravia_vendor_common::{account::first_account_label, common, connection_check};
 use stravia_vendor_sdk::{
-    AllowanceAmount, AllowanceItem, AllowanceResponse, ErrorKind, GuestHost, HttpRequest, LogLevel,
-    PluginError, ProviderSnapshot, read_http_body,
+    AllowanceAmount, AllowanceItem, AllowanceResponse, ConnectionCheckResponse,
+    ConnectionCheckVerification, ErrorKind, GuestHost, HttpRequest, LogLevel, PluginError,
+    ProviderSnapshot, read_http_body,
 };
 
 use crate::{Region, auth};
@@ -37,10 +38,12 @@ pub(crate) fn execute(
         totals.include(package(row)?)?;
     }
     // 资料只是附加展示；读取失败不能抹掉已经成功取得的积分。
-    let account_label = load_account_label(host, provider, region).unwrap_or_else(|_| {
-        host.log(LogLevel::Warn, "WorkBuddy account profile is unavailable");
-        None
-    });
+    let account_label = load_account_profile(host, provider, region)
+        .map(|value| account_label(&value, provider, region))
+        .unwrap_or_else(|_| {
+            host.log(LogLevel::Warn, "WorkBuddy account profile is unavailable");
+            None
+        });
     Ok(AllowanceResponse {
         allowances: vec![totals.into_allowance(region)],
         models: Vec::new(),
@@ -50,11 +53,28 @@ pub(crate) fn execute(
     })
 }
 
-fn load_account_label(
+pub(crate) fn check_connection(
     host: &GuestHost,
     provider: &ProviderSnapshot,
     region: Region,
-) -> Result<Option<String>, PluginError> {
+) -> Result<ConnectionCheckResponse, PluginError> {
+    // 固定区域的受保护资料接口只证明凭据有效，不生成内容、不刷新令牌或写入状态。
+    let value = load_account_profile(host, provider, region)?;
+    matching_account(&value, provider, region).ok_or_else(|| {
+        connection_check::invalid_response(
+            "WorkBuddy account profile did not uniquely match the current account and enterprise",
+        )
+    })?;
+    Ok(ConnectionCheckResponse {
+        verified: ConnectionCheckVerification::Credentials,
+    })
+}
+
+fn load_account_profile(
+    host: &GuestHost,
+    provider: &ProviderSnapshot,
+    region: Region,
+) -> Result<Value, PluginError> {
     let path = match region {
         Region::Cn => "/v2/plugin/account",
         Region::Intl => "/v2/plugin/accounts",
@@ -66,21 +86,33 @@ fn load_account_label(
         body: Vec::new(),
     })?;
     let status = response.status()?;
-    if !(200..300).contains(&status) {
-        return Err(malformed("WorkBuddy account profile HTTP request failed"));
-    }
+    let headers = response.headers()?;
     let bytes = read_http_body(&response, MAX_BODY_BYTES)?;
-    let value: Value =
-        serde_json::from_slice(&bytes).map_err(|_| malformed("invalid account profile JSON"))?;
-    if value.get("code").and_then(Value::as_i64) != Some(0) {
-        return Err(malformed(
-            "WorkBuddy account service rejected the profile query",
-        ));
+    if !(200..300).contains(&status) {
+        let mut error = common::upstream_error(status, &headers, &bytes);
+        error.message = format!("WorkBuddy account profile HTTP {status}");
+        return Err(error);
     }
-    Ok(account_label(&value, provider, region))
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| connection_check::invalid_response("invalid WorkBuddy account profile JSON"))?;
+    if value.get("code").and_then(Value::as_i64) != Some(0) {
+        let mut error = common::upstream_error(status, &headers, &bytes);
+        error.message = "WorkBuddy account service rejected the profile query".into();
+        return Err(error);
+    }
+    Ok(value)
 }
 
 fn account_label(value: &Value, provider: &ProviderSnapshot, region: Region) -> Option<String> {
+    let account = matching_account(value, provider, region)?;
+    first_account_label(["email", "nickname"].map(|key| account.get(key).and_then(Value::as_str)))
+}
+
+fn matching_account<'a>(
+    value: &'a Value,
+    provider: &ProviderSnapshot,
+    region: Region,
+) -> Option<&'a Value> {
     let uid = provider.credentials.get("uid")?.as_str()?.trim();
     let enterprise_id = provider
         .credentials
@@ -107,7 +139,7 @@ fn account_label(value: &Value, provider: &ProviderSnapshot, region: Region) -> 
     if matching.next().is_some() {
         return None;
     }
-    first_account_label(["email", "nickname"].map(|key| account.get(key).and_then(Value::as_str)))
+    Some(account)
 }
 
 fn packages(value: &Value) -> Result<&[Value], PluginError> {

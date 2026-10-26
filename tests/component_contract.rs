@@ -19,8 +19,9 @@ use stravia_vendor_runtime::{
     LogLevel, OperationScope, RuntimeError, RuntimeEvent, VendorRuntime, WsRequest,
 };
 use stravia_vendor_sdk::{
-    AllowanceRequest, AuthRequest, AuthResponse, AuthStep, DiscoverRequest, ErrorKind,
-    HttpContentCoding, OperationInput, OperationOutput, ProviderSnapshot,
+    AllowanceRequest, AuthRequest, AuthResponse, AuthStep, ConnectionCheckRequest,
+    ConnectionCheckVerification, DiscoverRequest, ErrorKind, HttpContentCoding, OperationInput,
+    OperationOutput, ProviderSnapshot,
 };
 
 struct Reply {
@@ -1168,6 +1169,156 @@ async fn regional_allowance_contract() {
         println!(
             "{region}: summary credit totals, readable account selection, account/tenant isolation, optional profile failures, incomplete-package rejection and upstream failures passed"
         );
+    }
+}
+
+#[tokio::test]
+#[ignore = "build the release wasm32-wasip2 component first"]
+async fn connection_checks_require_matching_account_evidence_without_side_effects() {
+    let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/wasm32-wasip2/release/stravia_vendor_workbuddy.wasm");
+    let runtime = VendorRuntime::new().unwrap();
+    let plugin = runtime
+        .load(&std::fs::read(artifact).unwrap())
+        .await
+        .unwrap();
+    for (region, domain) in [("cn", "www.workbuddy.cn"), ("intl", "www.workbuddy.ai")] {
+        let origin = format!("https://{domain}");
+        let local = LocalUpstream::new(&[&origin]);
+        let state = b"existing-auth-and-paid-window".to_vec();
+        *local.state.lock() = Some(state.clone());
+        let mut provider = snapshot(region, &origin);
+        provider.model = None;
+        provider.credentials = BTreeMap::from([
+            ("region".into(), json!(region)),
+            ("domain".into(), json!(domain)),
+            ("uid".into(), json!("check-account")),
+            ("access_token".into(), json!(token(domain, "check-account", 1))),
+        ]);
+        let input = |provider| OperationInput::ConnectionCheck {
+            provider,
+            request: ConnectionCheckRequest::default(),
+        };
+        let envelope = |account: Value| {
+            json!({"code":0,"data":if region == "cn" {
+                account
+            } else {
+                json!({"accounts":[account]})
+            }})
+        };
+        // 没有邮箱或昵称也可以证明身份；检查不依赖展示字段或可用模型。
+        for enterprise in [None, Some("check-tenant")] {
+            let mut current = provider.clone();
+            if let Some(id) = enterprise {
+                current.credentials.insert("enterprise_id".into(), json!(id));
+            }
+            local.reply(Reply::json(envelope(json!({
+                "uid":"check-account","enterpriseId":enterprise
+            }))));
+            let output = run(&runtime, &plugin, region, input(current), local.scope())
+                .await
+                .unwrap();
+            let OperationOutput::ConnectionCheck(result) = output else {
+                panic!("expected connection check result")
+            };
+            assert_eq!(result.verified, ConnectionCheckVerification::Credentials);
+        }
+        for payload in [
+            json!({}),
+            envelope(json!({})),
+            envelope(json!({"uid":"other-account"})),
+            envelope(json!({"uid":"check-account","enterpriseId":"other-tenant"})),
+            envelope(json!({"uid":"check-account","enterpriseId":123})),
+            json!({"code":0,"data":{"accounts":[]}}),
+        ] {
+            local.reply(Reply::json(payload));
+            let error = run(
+                &runtime,
+                &plugin,
+                region,
+                input(provider.clone()),
+                local.scope(),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                RuntimeError::Plugin {
+                    kind: ErrorKind::InvalidResponse | ErrorKind::Upstream(_),
+                    ..
+                }
+            ));
+        }
+        if region == "intl" {
+            local.reply(Reply::json(json!({"code":0,"data":{"accounts":[
+                {"uid":"check-account"},{"uid":"check-account"}
+            ]}})));
+            let error = run(
+                &runtime,
+                &plugin,
+                region,
+                input(provider.clone()),
+                local.scope(),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                RuntimeError::Plugin { kind: ErrorKind::InvalidResponse, .. }
+            ));
+        }
+        for (status, body) in [
+            (200, b"<html>login</html>".as_slice()),
+            (200, br#"{"code":1001,"msg":"do-not-echo"}"#.as_slice()),
+            (401, br#"{"error":{"message":"do-not-echo"}}"#.as_slice()),
+            (429, b"{}".as_slice()),
+        ] {
+            local.reply(Reply {
+                status,
+                headers: vec![("retry-after".into(), "13".into())],
+                chunks: Mutex::new(VecDeque::from([body.to_vec()])),
+            });
+            let before = local.requests.lock().len();
+            let error = run(
+                &runtime,
+                &plugin,
+                region,
+                input(provider.clone()),
+                local.scope(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(local.requests.lock().len(), before + 1);
+            if status != 200 {
+                assert_eq!(error.upstream_status(), Some(status));
+            }
+            if status == 429 {
+                assert_eq!(error.retry_after(), Some(Duration::from_secs(13)));
+            }
+            assert!(!error.diagnostic_message().unwrap_or_default().contains("do-not-echo"));
+        }
+        let before = local.requests.lock().len();
+        provider.credentials.insert(
+            "region".into(),
+            json!(if region == "cn" { "intl" } else { "cn" }),
+        );
+        let error = run(&runtime, &plugin, region, input(provider), local.scope())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RuntimeError::Plugin { kind: ErrorKind::Auth, .. }));
+        assert_eq!(local.requests.lock().len(), before);
+        for request in local.requests.lock().iter() {
+            assert_eq!(request.method, "GET");
+            assert_eq!(
+                request.url,
+                format!("{origin}/v2/plugin/{}", if region == "cn" { "account" } else { "accounts" })
+            );
+            assert_no_chat_identity_headers(request);
+        }
+        assert_eq!(*local.state.lock(), Some(state));
+        assert!(local.events.lock().is_empty());
+        assert!(local.replies.lock().is_empty());
+        println!("{region}: credential evidence, identity isolation, response failures and read-only connection checks passed");
     }
 }
 

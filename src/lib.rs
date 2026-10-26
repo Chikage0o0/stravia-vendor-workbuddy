@@ -151,6 +151,10 @@ impl VendorGuest for WorkBuddy {
                 provider,
                 request: _,
             } => allowance::execute(host, &provider, region).map(OperationOutput::Allowance),
+            OperationInput::ConnectionCheck { provider, .. } => {
+                allowance::check_connection(host, &provider, region)
+                    .map(OperationOutput::ConnectionCheck)
+            }
             OperationInput::ConfigValidation {
                 provider: _,
                 request,
