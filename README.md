@@ -239,9 +239,9 @@ Node 版本选择已安装 WorkBuddy 所用 Electron `37.10.3` 对应的 Node `2
 
 ## 自行构建
 
-当前源码使用插件目录旁的完整 `StraviaPlatform/` checkout，五个 Stravia 依赖统一指向 `../StraviaPlatform/backend/crates/...`；不能只下载本插件源码。v0.3.3 使用 SDK crate `0.5.3`、WIT ABI `stravia:vendor@0.6.0`，并延续额度账号展示、SDK `OriginHost` 与 Core 主机正则权限实现要求，不能只按 crate 版本号判断兼容性。
+当前源码的五个 Stravia 依赖（含测试用 `stravia-vendor-runtime`）统一使用 [StraviaPlatform](https://github.com/Stravia-AI/StraviaPlatform) 的 Cargo Git 依赖；只需检出本插件，无需在相邻目录放置宿主源码。Cargo 会按 `Cargo.toml` 的 `git`／`rev` 获取上游，并用 `Cargo.lock` 锁定来源。v0.3.3 使用 SDK crate `0.5.3`、WIT ABI `stravia:vendor@0.6.0`，并延续额度账号展示、SDK `OriginHost` 与 Core 主机正则权限实现要求，不能只按 crate 版本号判断兼容性。
 
-发布工作流按同一目录关系检出到 `source/StraviaPlatform`，默认固定到 [`3f41ba2a9201518919524e8a42a53f45b2f8b55d`](https://github.com/Stravia-AI/StraviaPlatform/commit/3f41ba2a9201518919524e8a42a53f45b2f8b55d)，对应本次同步的 `dev` 提交，包含草稿感知连接检查、Wasm 持久编译缓存及实例化预编译数据复用。现有 `STRAVIA_PLATFORM_REF` 仓库变量可指定其他固定 revision；覆盖后须核对 SDK、protocol-codec 和 vendor-runtime 契约，并通过构建与真实组件验证。Rust workspace crate 版本与 WIT ABI 包版本是两套版本号；新版宿主明确拒绝旧 `0.5.1` ABI 组件，旧宿主也不能加载本次 `0.6.0` 组件，必须同步升级宿主并重新导入新 Wasm。
+当前 Git 依赖统一固定到 [`3f41ba2a9201518919524e8a42a53f45b2f8b55d`](https://github.com/Stravia-AI/StraviaPlatform/commit/3f41ba2a9201518919524e8a42a53f45b2f8b55d)，对应本次同步的 `dev` 提交，包含草稿感知连接检查、Wasm 持久编译缓存及实例化预编译数据复用。发布工作流只检出本插件，不再单独检出宿主或读取 `STRAVIA_PLATFORM_REF` 仓库变量。升级上游时须同步修改五个依赖的 `rev` 与锁文件，核对 SDK、protocol-codec 和 vendor-runtime 契约，并通过构建与真实组件验证。Rust workspace crate 版本与 WIT ABI 包版本是两套版本号；新版宿主明确拒绝旧 `0.5.1` ABI 组件，旧宿主也不能加载本次 `0.6.0` 组件，必须同步升级宿主并重新导入新 Wasm。
 
 `assets/workbuddy.svg` 使用 [WorkBuddy 官方 SVG](https://download.codebuddy.ai/web/workbuddy/f5bce0c03cdc17fa28d25634fb48d2791c297da3/assets/logo.svg) 的原始 mascot 和双眼几何，去掉背景、渐变及模糊，编译进 Wasm 为透明单色图标。显示需要更新后的 Stravia 宿主并重新导入插件，不在运行时下载品牌资源。图标归属和使用限制见 [NOTICE](NOTICE)。
 
@@ -273,15 +273,16 @@ npx --yes --ignore-scripts rea-agents@6.7.0 --help
 
 ## v0.3.3 升级说明
 
-- 五个 Stravia 路径依赖、锁文件与发布工作流固定到上述 `dev` 提交；SDK crate 仍为 `0.5.3`，WIT ABI 切换为 `0.6.0`。canonical format 仍为 `1`，现有认证凭据、连接配置、区域隔离、网络权限、聊天／图片请求及自动付费策略不变。
+- 五个 Stravia 依赖统一改为固定到上述 `dev` 提交的 Git 依赖，锁文件同步记录 Git 来源；发布工作流不再依赖相邻宿主 checkout。SDK crate 仍为 `0.5.3`，WIT ABI 切换为 `0.6.0`。canonical format 仍为 `1`，现有认证凭据、连接配置、区域隔离、网络权限、聊天／图片请求及自动付费策略不变。
 - 新增上述只读连接检查，复用额度展示的账号资料请求和唯一身份匹配逻辑；不会把缺少邮箱／昵称视为凭据失效。资料查询失败在连接检查中明确失败，但在额度查询中仍只省略附加账号展示，不丢弃已取得的积分。
 - Wasm 编译缓存与实例化优化由新版宿主运行时实现，无需为插件增加缓存目录、持久状态或配置项。
 - Rust `1.99.1` release Wasm 构建、36 项单元测试和 12 项真实组件契约通过。新增契约覆盖无模型／无展示字段的身份验证、个人／企业账号、错账号／企业、重复匹配、非法响应、业务拒绝、HTTP 401／429、跨区域凭据出站前拒绝，以及无重试、无推理事件和私有状态不变。
+- 五个依赖均通过 Cargo 元数据确认来自同一 Git revision；另在没有相邻 `StraviaPlatform` 目录的临时源码副本中完成 `--locked` release Wasm 构建，验证独立检出本插件即可构建。
 - 独立程序加载新 Wasm，以合成凭据完成两区共 10 次真实 loopback TCP 交换，验证凭据检查成功、错账号拒绝、HTTP 429／`Retry-After` 保留，以及原有精确积分与昵称展示。此次仅使用本地网络，没有调用真实账号服务、消耗积分或验证管理页面视觉效果；使用新版须同步升级宿主并重新导入组件。
 
 ## v0.3.2 升级说明
 
-- 五个 Stravia 路径依赖与锁文件同步到上述 `dev` 固定提交的 `0.5.3`；额度响应显式提供可选 `account_label`。canonical format、WIT、认证凭据、连接配置和出站权限不变。
+- 当时五个 Stravia 路径依赖与锁文件同步到 [`4b41929ea60e2ef3be31b3f410f18225435d75db`](https://github.com/Stravia-AI/StraviaPlatform/commit/4b41929ea60e2ef3be31b3f410f18225435d75db) 的 `0.5.3`；额度响应显式提供可选 `account_label`。canonical format、WIT、认证凭据、连接配置和出站权限不变。
 - 插件来源标签、来源搜索和无目录供应商的额度类型筛选由宿主实现，需要同步升级 Stravia Core／WebUI；只重新导入 Wasm 不会更新宿主界面。WorkBuddy 保留 `Dedicated`、独立 `provider_id`、空 `catalog_id` 与内嵌 SVG，不伪造官方内置来源或其他品牌目录关联。
 - 账号展示接入上述官方插件资料接口，邮箱优先、昵称兜底；更新后重新导入插件并刷新额度即可，无需重新登录。接口和认证方式分别对照国内 WorkBuddy `5.8.3` 的 `AccountScopedExternalLinkAuthenticationProvider.fetchCurrentAccount`、国际 WorkBuddy AI `5.8.4` 的 `getAccountSnapshot` 及内嵌产品配置核实，不将网页 Cookie 资料入口误认为唯一来源。
 - 2026-10-23 使用用户授权的部署凭据执行三次只读资料 GET：国内一个连接、国际两个连接均为 HTTP 200／`code: 0`，返回账号与当前凭据唯一匹配，三个账号均返回 `nickname`，均没有返回 `email`。这证明昵称可取，不承诺每个账号都有邮箱。凭据留在远程进程中使用，没有打印、复制或写回数据库；没有调用聊天、生图或消耗积分。
@@ -337,7 +338,7 @@ npx --yes --ignore-scripts rea-agents@6.7.0 --help
 
 - **不兼容变更**：推理请求体和请求头仅保留官方 CLI 白名单内的字段。白名单外的参数和自定义请求头不再透传；依赖这些字段的调用方须调整配置。提示词、工具参数和 JSON Schema 等用户数据保持原文。
 - WorkBuddy SVG 图标已嵌入插件。显示图标需要支持 `ProviderDescriptor.icon_svg` 的新版 Stravia 宿主，并重新导入插件。
-- 更新 Stravia SDK 和认证响应契约；源码构建需要上文指定的完整 Stravia checkout。
+- 更新 Stravia SDK 和认证响应契约；该版本采用完整 Stravia checkout，当前源码则按上文的 Git 依赖构建。
 
 ## 发布流程（维护者）
 

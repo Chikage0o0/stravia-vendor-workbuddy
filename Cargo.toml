@@ -12,10 +12,10 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-stravia-vendor-sdk = { path = "../StraviaPlatform/backend/crates/stravia-vendor-sdk" }
-stravia-vendor-common = { path = "../StraviaPlatform/backend/crates/stravia-vendor-common" }
-stravia-runtime-contract = { path = "../StraviaPlatform/backend/crates/stravia-runtime-contract" }
-stravia-protocol-codec = { path = "../StraviaPlatform/backend/crates/stravia-protocol-codec" }
+stravia-vendor-sdk = { git = "https://github.com/Stravia-AI/StraviaPlatform", rev = "3f41ba2a9201518919524e8a42a53f45b2f8b55d" }
+stravia-vendor-common = { git = "https://github.com/Stravia-AI/StraviaPlatform", rev = "3f41ba2a9201518919524e8a42a53f45b2f8b55d" }
+stravia-runtime-contract = { git = "https://github.com/Stravia-AI/StraviaPlatform", rev = "3f41ba2a9201518919524e8a42a53f45b2f8b55d" }
+stravia-protocol-codec = { git = "https://github.com/Stravia-AI/StraviaPlatform", rev = "3f41ba2a9201518919524e8a42a53f45b2f8b55d" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 semver = { version = "1", features = ["serde"] }
@@ -34,7 +34,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
-stravia-vendor-runtime = { path = "../StraviaPlatform/backend/crates/stravia-vendor-runtime" }
+stravia-vendor-runtime = { git = "https://github.com/Stravia-AI/StraviaPlatform", rev = "3f41ba2a9201518919524e8a42a53f45b2f8b55d" }
 async-trait = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 parking_lot = "0.12"

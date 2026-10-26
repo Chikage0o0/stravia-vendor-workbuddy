@@ -1690,6 +1690,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stravia-protocol-codec"
 version = "0.5.3"
+source = "git+https://github.com/Stravia-AI/StraviaPlatform?rev=3f41ba2a9201518919524e8a42a53f45b2f8b55d#3f41ba2a9201518919524e8a42a53f45b2f8b55d"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1706,6 +1707,7 @@ dependencies = [
 [[package]]
 name = "stravia-runtime-contract"
 version = "0.5.3"
+source = "git+https://github.com/Stravia-AI/StraviaPlatform?rev=3f41ba2a9201518919524e8a42a53f45b2f8b55d#3f41ba2a9201518919524e8a42a53f45b2f8b55d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1724,6 +1726,7 @@ dependencies = [
 [[package]]
 name = "stravia-vendor-common"
 version = "0.5.3"
+source = "git+https://github.com/Stravia-AI/StraviaPlatform?rev=3f41ba2a9201518919524e8a42a53f45b2f8b55d#3f41ba2a9201518919524e8a42a53f45b2f8b55d"
 dependencies = [
  "chrono",
  "http",
@@ -1736,6 +1739,7 @@ dependencies = [
 [[package]]
 name = "stravia-vendor-runtime"
 version = "0.5.3"
+source = "git+https://github.com/Stravia-AI/StraviaPlatform?rev=3f41ba2a9201518919524e8a42a53f45b2f8b55d#3f41ba2a9201518919524e8a42a53f45b2f8b55d"
 dependencies = [
  "async-trait",
  "libc",
@@ -1752,6 +1756,7 @@ dependencies = [
 [[package]]
 name = "stravia-vendor-sdk"
 version = "0.5.3"
+source = "git+https://github.com/Stravia-AI/StraviaPlatform?rev=3f41ba2a9201518919524e8a42a53f45b2f8b55d#3f41ba2a9201518919524e8a42a53f45b2f8b55d"
 dependencies = [
  "base64 0.23.1",
  "regex",
