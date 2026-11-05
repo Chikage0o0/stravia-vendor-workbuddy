@@ -11,8 +11,8 @@ mod messages {
 use stravia_runtime_contract::protocol::ir::AiRequest;
 use stravia_vendor_common::common;
 use stravia_vendor_sdk::{
-    ErrorKind, GuestHost, Operation, OperationInput, OperationOutput, PluginError,
-    ProviderSnapshot, VendorDescriptor, VendorGuest,
+    ConnectionCheckResponse, ErrorKind, GuestHost, Operation, OperationInput, OperationOutput,
+    PluginError, ProviderSnapshot, VendorDescriptor, VendorGuest,
 };
 
 pub const VENDOR_ID: &str = "workbuddy";
@@ -103,6 +103,15 @@ pub struct WorkBuddy;
 impl VendorGuest for WorkBuddy {
     fn descriptor() -> VendorDescriptor {
         descriptor()
+    }
+
+    fn check_connection(
+        host: &GuestHost,
+        channel: &str,
+        provider: ProviderSnapshot,
+    ) -> Result<ConnectionCheckResponse, PluginError> {
+        let region = admit(channel, &provider)?;
+        allowance::check_connection(host, &provider, region)
     }
 
     fn select_protocol(

@@ -11,6 +11,7 @@
 - 🤖 **模型自动发现** — 从账号 `/v3/config` 的默认 agent 名单实时发现模型，按上游配置合并免费／付费线路；可选 `model_ids` 白名单只同步指定模型
 - **可选自动付费线路** — 默认关闭；开启后可在免费线路返回 `6004` 频控错误、且尚未输出响应时自动切换付费线路并消耗积分
 - 📊 **额度查询** — 读取账号积分资源包余量（国内版走独立计费域 `codebuddy.cn`）
+- **只读连接检查** — 用账号积分接口验证凭据，不生成内容、不同步模型，也不改写登录状态
 - 🧩 **wasm 沙箱组件** — 仅能访问插件声明的网络 origin，凭据由宿主持久化并跨连接隔离
 
 ## 快速开始
@@ -32,6 +33,8 @@
    - **国际版**：国际版 WorkBuddy AI 账号
 3. 发起浏览器授权：打开插件返回的授权链接，完成 WorkBuddy 登录；授权窗口有效期 10 分钟
 4. 授权完成后连接就绪，模型列表自动从账号同步
+
+登录后可使用 **测试连接**：插件仅查询积分接口的第一页，国内版固定访问 `https://www.codebuddy.cn`，国际版固定访问 `https://www.workbuddy.ai`。有效的空资源包列表也表示凭据验证通过；成功范围为 `Credentials`，不代表聊天端点或指定模型已经验证。检查不刷新令牌、不扣推理积分，也不修改宿主私有状态；实际模型可用性仍须通过聊天请求确认。
 
 ### 4. 客户端接入
 
@@ -112,11 +115,11 @@ API Key:  由 Stravia 访问控制配置决定
 
 ## 自行构建
 
-当前源码使用插件目录旁的完整 `StraviaPlatform/` checkout，五个 Stravia 依赖统一指向 `../StraviaPlatform/backend/crates/...`；不能只下载本插件源码。发布工作流按同一目录关系检出到 `source/StraviaPlatform`；`STRAVIA_PLATFORM_REF` 仓库变量可指定 revision，默认固定 dev 提交 `7fac0bc5af644ae13c389b219700a9c4359181af`，SDK 版本仍为 `0.4.0`。本地 checkout 应使用同一提交。覆盖该变量前须核对 SDK、protocol-codec 和 vendor-runtime 契约，并通过构建与真实组件验证。
+当前源码使用插件目录旁的完整 `StraviaPlatform/` checkout，五个 Stravia 依赖统一指向 `../StraviaPlatform/backend/crates/...`；不能只下载本插件源码。发布工作流按同一目录关系检出到 `source/StraviaPlatform`；`STRAVIA_PLATFORM_REF` 仓库变量可指定 revision，默认固定 dev 提交 [`83613f4752178e952226fc21a386c3c79a4e3131`](https://github.com/Stravia-AI/StraviaPlatform/commit/83613f4752178e952226fc21a386c3c79a4e3131)，SDK 版本为 `0.6.2`，WIT 为 `stravia:vendor@0.6.0`。本地 checkout 应使用同一提交。覆盖该变量前须核对 SDK、protocol-codec 和 vendor-runtime 契约，并通过构建与真实组件验证。
 
 `assets/workbuddy.svg` 使用 [WorkBuddy 官方 SVG](https://download.codebuddy.ai/web/workbuddy/f5bce0c03cdc17fa28d25634fb48d2791c297da3/assets/logo.svg) 的原始 mascot 和双眼几何，去掉背景、渐变及模糊，编译进 Wasm 为透明单色图标。显示需要更新后的 Stravia 宿主并重新导入插件，不在运行时下载品牌资源。图标归属和使用限制见 [NOTICE](NOTICE)。
 
-依赖：Rust `1.99.0`（`rust-toolchain.toml` 已锁定，与上游最低版本一致）+ `wasm32-wasip2` target；可选安装 [Task](https://taskfile.dev)。若环境变量 `RUSTUP_TOOLCHAIN` 覆盖了项目工具链，须清除覆盖或在下列命令中使用 `cargo +1.99.0`。
+依赖：Rust `1.99.1`（`rust-toolchain.toml` 已锁定，与上游构建工具链一致，最低 Rust 仍为 `1.99.0`）+ `wasm32-wasip2` target；可选安装 [Task](https://taskfile.dev)。若环境变量 `RUSTUP_TOOLCHAIN` 覆盖了项目工具链，须清除覆盖或在下列命令中使用 `cargo +1.99.1`。
 
 ```bash
 # 仅构建组件
@@ -130,9 +133,17 @@ task dist
 task test
 ```
 
+## v0.3.0 升级说明
+
+- **不兼容变更**：同步上述 Stravia dev 提交，WIT 从 `stravia:vendor@0.5.0` 升至 `stravia:vendor@0.6.0`，canonical format 仍为 `1`。先升级至支持该 ABI 的宿主，再重新导入新构建的插件；不能继续使用旧的 Wasm 包替代本次更新。
+- 实现 SDK 必需的 `VendorGuest::check_connection`，不声明已经移除的 `connection_check` capability。检查复用固定区域的只读计费请求，仅验证业务状态及 `Accounts` 数组，不查询后续页、不解析积分包金额。HTTP 401/403 保留认证／授权错误和状态码；成功 HTTP 中的畸形 JSON、业务失败或缺失账户结构返回 `InvalidResponse`，不回显上游敏感正文。
+- 适配新版运行时的 `WsRequest` 与精确主机声明类型；网络权限仍限于原有固定 origin，不新增正则主机或压缩策略。额度响应的账号显示名及计费建议保持未知，不从 UID 或积分资源包猜测。
+- 发布锁定、依赖锁文件及 Rust 工具链同步更新。国内／国际客户端身份、推理参数白名单、区域凭据隔离和自动付费线路授权策略保持不变。
+- 使用 Rust `1.99.1` 通过 release Wasm 构建、37 项单元测试和 9 项真实组件契约。独立离线程序加载实际组件，完成 CN／Intl 的凭据检查及 Responses canonical → Chat SSE 推理，验证 JSON Schema、缓存白名单、响应文本与 usage；未调用真实账号服务。
+
 ## v0.2.1 升级说明
 
-- 对齐上述 Stravia dev 提交的统一 canonical 请求控制，并将最低 Rust 与构建工具链同步升至 `1.99.0`。沿用 SDK 的 owned 请求、参数归一化与显式编码组件执行接口；canonical format 仍为 `1`，不新增旧字段透传或兼容分支。频道请求头声明、WebSocket reuse-age 参数、请求白名单、区域凭据隔离与既有付费线路授权策略保持不变。
+- 对齐 Stravia dev 提交 `7fac0bc5af644ae13c389b219700a9c4359181af`（SDK `0.4.0`）的统一 canonical 请求控制，并将最低 Rust 与构建工具链同步升至 `1.99.0`。沿用 SDK 的 owned 请求、参数归一化与显式编码组件执行接口；canonical format 仍为 `1`，不新增旧字段透传或兼容分支。频道请求头声明、WebSocket reuse-age 参数、请求白名单、区域凭据隔离与既有付费线路授权策略保持不变。
 - 分别更新国内与国际客户端产品及内嵌 CLI 身份，不混用区域发行版本。组件契约检查 `X-IDE-Version` 与 User-Agent 的产品版本一致性，不固定发行版本默认值。
 - 组件契约覆盖宿主目标 effort 优先于入口 effort，并确认统一缓存参数 `prompt_cache_key` 仍不能绕过官方 CLI 白名单。Chat 目标关闭思考使用 `Effort { value: "none" }`，不使用其它目标协议的 `Disabled` 控制。
 - 使用锁定 Rust 工具链通过 37 项单元测试与 8 项真实 Wasm 组件契约；独立离线程序加载组件，完成 CN / Intl 的 Responses canonical → 协议选择 → Chat SSE 推理，验证思考开启／关闭、目标优先级、JSON Schema、缓存白名单及 usage。本轮未调用真实账号服务；使用新版须重新构建并导入插件。
@@ -148,8 +159,8 @@ task test
 版本号以 `Cargo.toml` 的 `version` 为准。同步更新 `Cargo.lock` 中本插件的版本，运行 `task verify`，提交版本变更并推送后，打 tag 触发 GitHub Action 构建并发布 Release：
 
 ```bash
-git tag -a v0.2.1 -m "发布 v0.2.1"
-git push origin v0.2.1
+git tag -a v0.3.0 -m "发布 v0.3.0"
+git push origin v0.3.0
 ```
 
 tag 的 `v` 前缀版本号必须与 `Cargo.toml` 一致，否则 workflow 拒绝发布。Release 附件包含 `stravia-vendor-workbuddy-v<版本>.wasm`、`SHA256SUMS`、`LICENSE`、`NOTICE` 及第三方组件许可证。

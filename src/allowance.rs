@@ -2,8 +2,9 @@ use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use stravia_vendor_common::common;
 use stravia_vendor_sdk::{
-    AllowanceAmount, AllowanceItem, AllowanceResponse, ErrorKind, GuestHost, HttpRequest,
-    PluginError, ProviderSnapshot, read_http_body,
+    AllowanceAmount, AllowanceItem, AllowanceResponse, ConnectionCheckResponse,
+    ConnectionCheckVerification, ErrorKind, GuestHost, HttpRequest, PluginError, ProviderSnapshot,
+    read_http_body,
 };
 
 use crate::{Region, auth};
@@ -13,6 +14,20 @@ const PAGE_SIZE: usize = 100;
 const MAX_PAGES: usize = 100;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
+pub(crate) fn check_connection(
+    host: &GuestHost,
+    provider: &ProviderSnapshot,
+    region: Region,
+) -> Result<ConnectionCheckResponse, PluginError> {
+    let begin = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let value = resource_page(host, provider, region, 1, &begin)?;
+    // 仅验证账户响应结构，不分页、不解析积分包，也不修改账户私有状态。
+    accounts(&value)?;
+    Ok(ConnectionCheckResponse {
+        verified: ConnectionCheckVerification::Credentials,
+    })
+}
+
 pub(crate) fn execute(
     host: &GuestHost,
     provider: &ProviderSnapshot,
@@ -20,34 +35,8 @@ pub(crate) fn execute(
 ) -> Result<AllowanceResponse, PluginError> {
     let mut totals = Credits::default();
     let begin = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    // 国内计费域与聊天域不同；地址不从令牌、响应或私有状态获取。
-    let url = format!("{}{RESOURCE_PATH}", region.website());
     for page in 1..=MAX_PAGES {
-        let body = serde_json::to_vec(&json!({
-            "PageNumber": page,
-            "PageSize": PAGE_SIZE,
-            "ProductCode": "p_tcaca",
-            "Status": [0, 3],
-            "PackageEndTimeRangeBegin": begin,
-            "PackageEndTimeRangeEnd": "2036-01-01 00:00:00"
-        }))
-        .map_err(|_| malformed("could not encode allowance request"))?;
-        let response = host.http_start(HttpRequest {
-            method: "POST".into(),
-            url: url.clone(),
-            headers: auth::billing_headers(provider, region)?,
-            body,
-        })?;
-        let status = response.status()?;
-        let headers = response.headers()?;
-        let bytes = read_http_body(&response, MAX_BODY_BYTES)?;
-        if !(200..300).contains(&status) {
-            let mut error = common::upstream_error(status, &headers, &bytes);
-            error.message = format!("WorkBuddy allowance HTTP {status}");
-            return Err(error);
-        }
-        let value: Value =
-            serde_json::from_slice(&bytes).map_err(|_| malformed("invalid allowance JSON"))?;
+        let value = resource_page(host, provider, region, page, &begin)?;
         let rows = accounts(&value)?;
         for row in rows {
             totals.include(package(row)?)?;
@@ -57,6 +46,8 @@ pub(crate) fn execute(
                 allowances: vec![totals.into_allowance(region)],
                 models: Vec::new(),
                 plan_label: None,
+                account_label: None,
+                billing: None,
             });
         }
     }
@@ -64,6 +55,40 @@ pub(crate) fn execute(
         ErrorKind::ResourceExhausted,
         "WorkBuddy allowance pagination exceeded the guest limit",
     ))
+}
+
+fn resource_page(
+    host: &GuestHost,
+    provider: &ProviderSnapshot,
+    region: Region,
+    page: usize,
+    begin: &str,
+) -> Result<Value, PluginError> {
+    let body = serde_json::to_vec(&json!({
+        "PageNumber": page,
+        "PageSize": PAGE_SIZE,
+        "ProductCode": "p_tcaca",
+        "Status": [0, 3],
+        "PackageEndTimeRangeBegin": begin,
+        "PackageEndTimeRangeEnd": "2036-01-01 00:00:00"
+    }))
+    .map_err(|_| malformed("could not encode allowance request"))?;
+    // 国内计费域与聊天域不同；地址不从令牌、响应或私有状态获取。
+    let response = host.http_start(HttpRequest {
+        method: "POST".into(),
+        url: format!("{}{RESOURCE_PATH}", region.website()),
+        headers: auth::billing_headers(provider, region)?,
+        body,
+    })?;
+    let status = response.status()?;
+    let headers = response.headers()?;
+    let bytes = read_http_body(&response, MAX_BODY_BYTES)?;
+    if !(200..300).contains(&status) {
+        let mut error = common::upstream_error(status, &headers, &bytes);
+        error.message = format!("WorkBuddy allowance HTTP {status}");
+        return Err(error);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| invalid_response("invalid allowance JSON"))
 }
 
 fn accounts(value: &Value) -> Result<&[Value], PluginError> {
@@ -77,7 +102,7 @@ fn accounts(value: &Value) -> Result<&[Value], PluginError> {
             .pointer("/Response/Error")
             .is_some_and(|error| !error.is_null())
     {
-        return Err(malformed(
+        return Err(invalid_response(
             "WorkBuddy billing service rejected the allowance query",
         ));
     }
@@ -85,7 +110,7 @@ fn accounts(value: &Value) -> Result<&[Value], PluginError> {
         .pointer("/data/Response/Data/Accounts")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
-        .ok_or_else(|| malformed("WorkBuddy allowance response has no Accounts array"))
+        .ok_or_else(|| invalid_response("WorkBuddy allowance response has no Accounts array"))
 }
 
 struct Credits {
@@ -241,6 +266,10 @@ fn credit(value: Decimal) -> AllowanceAmount {
 
 fn malformed(message: &str) -> PluginError {
     common::plugin_error(ErrorKind::upstream_unknown(), message)
+}
+
+fn invalid_response(message: &str) -> PluginError {
+    common::plugin_error(ErrorKind::InvalidResponse, message)
 }
 
 #[cfg(test)]

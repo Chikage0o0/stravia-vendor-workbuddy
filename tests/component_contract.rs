@@ -9,15 +9,16 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use stravia_protocol_codec::transform::ProtocolTransform;
-use stravia_runtime_contract::{CancellationToken, Deadline};
+use stravia_runtime_contract::{CancellationToken, Deadline, protocol::ir::AiErrorKind};
 use stravia_vendor_common::common;
 use stravia_vendor_runtime::{
     HostFailure, HostHttpResponse, HostServices, HostWebSocket, HttpRequest, LoadedPlugin,
-    LogLevel, OperationScope, RuntimeError, RuntimeEvent, VendorRuntime,
+    LogLevel, OperationScope, RuntimeError, RuntimeEvent, VendorRuntime, WsRequest,
 };
 use stravia_vendor_sdk::{
-    AllowanceRequest, AuthRequest, AuthResponse, AuthStep, DiscoverRequest, ErrorKind,
-    OperationInput, OperationOutput, ProviderSnapshot,
+    AllowanceRequest, AuthRequest, AuthResponse, AuthStep, ConnectionCheckRequest,
+    ConnectionCheckVerification, DiscoverRequest, ErrorKind, OperationInput, OperationOutput,
+    ProviderSnapshot,
 };
 
 struct Reply {
@@ -61,6 +62,7 @@ struct LocalUpstream {
     replies: Mutex<VecDeque<Reply>>,
     requests: Mutex<Vec<HttpRequest>>,
     state: Mutex<Option<Vec<u8>>>,
+    state_writes: Mutex<usize>,
     events: Mutex<Vec<RuntimeEvent>>,
 }
 
@@ -71,6 +73,7 @@ impl LocalUpstream {
             replies: Mutex::new(VecDeque::new()),
             requests: Mutex::new(Vec::new()),
             state: Mutex::new(None),
+            state_writes: Mutex::new(0),
             events: Mutex::new(Vec::new()),
         })
     }
@@ -103,14 +106,7 @@ impl HostServices for LocalUpstream {
                 .expect("unexpected HTTP request or retry"),
         ))
     }
-    async fn ws_connect(
-        &self,
-        _: String,
-        _: Vec<(String, String)>,
-        _: Vec<String>,
-        _: Option<String>,
-        _: Option<u64>,
-    ) -> Result<Arc<dyn HostWebSocket>, HostFailure> {
+    async fn ws_connect(&self, _: WsRequest) -> Result<Arc<dyn HostWebSocket>, HostFailure> {
         Err(HostFailure::new(
             ErrorKind::Unsupported,
             "WebSocket is not allowed in this contract",
@@ -120,6 +116,7 @@ impl HostServices for LocalUpstream {
         Ok(self.state.lock().clone())
     }
     async fn write_private_state(&self, bytes: Vec<u8>) -> Result<(), HostFailure> {
+        *self.state_writes.lock() += 1;
         *self.state.lock() = Some(bytes);
         Ok(())
     }
@@ -762,6 +759,187 @@ fn resource_response(rows: Vec<Value>) -> Value {
     json!({"code":0,"data":{"Response":{"Data":{"Accounts":rows}}}})
 }
 
+/// 连接检查只验证固定账户端点上的凭据，不生成、不发现模型，也不绑定账户。
+#[tokio::test]
+#[ignore = "build the release wasm32-wasip2 component first"]
+async fn regional_read_only_connection_check_contract() {
+    let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/wasm32-wasip2/release/stravia_vendor_workbuddy.wasm");
+    let runtime = VendorRuntime::new().unwrap();
+    let plugin = runtime
+        .load(&std::fs::read(artifact).unwrap())
+        .await
+        .unwrap();
+    for (region, domain, billing, other_region, other_domain) in [
+        (
+            "cn",
+            "copilot.tencent.com",
+            "https://www.codebuddy.cn",
+            "intl",
+            "www.workbuddy.ai",
+        ),
+        (
+            "intl",
+            "www.workbuddy.ai",
+            "https://www.workbuddy.ai",
+            "cn",
+            "copilot.tencent.com",
+        ),
+    ] {
+        // 只批准计费源站，任何生成或模型同步请求都会直接失败。
+        let local = LocalUpstream::new(&[billing]);
+        let saved_state = br#"{"opaque":"preserve-account-state"}"#.to_vec();
+        *local.state.lock() = Some(saved_state.clone());
+        let mut provider = snapshot(region, &format!("https://{domain}"));
+        provider.credentials = BTreeMap::from([
+            ("region".into(), json!(region)),
+            ("domain".into(), json!(domain)),
+            ("uid".into(), json!("connection-account")),
+            (
+                "access_token".into(),
+                json!(token(domain, "connection-account", 1)),
+            ),
+        ]);
+        let input = |provider: ProviderSnapshot| OperationInput::ConnectionCheck {
+            provider,
+            request: ConnectionCheckRequest::default(),
+        };
+
+        // 空账户仍能验证凭据；满页也不能触发下一页额度汇总。
+        for rows in [
+            Vec::new(),
+            (0..100)
+                .map(|_| json!({"CapacitySize":2,"CapacityRemain":1}))
+                .collect(),
+        ] {
+            local.reply(Reply::json(resource_response(rows)));
+            let before = local.requests.lock().len();
+            let output = run(
+                &runtime,
+                &plugin,
+                region,
+                input(provider.clone()),
+                local.scope(),
+            )
+            .await
+            .unwrap();
+            let OperationOutput::ConnectionCheck(result) = output else {
+                panic!("expected connection check result")
+            };
+            assert_eq!(result.verified, ConnectionCheckVerification::Credentials);
+            let requests = local.requests.lock();
+            assert_eq!(requests.len(), before + 1);
+            let request = requests.last().unwrap();
+            assert_eq!(
+                request.url,
+                format!("{billing}/v2/billing/meter/get-user-resource")
+            );
+            assert_eq!(request.method, "POST");
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["PageNumber"], 1);
+            assert!(
+                request
+                    .headers
+                    .iter()
+                    .any(|(key, value)| key.eq_ignore_ascii_case("x-domain") && value == domain)
+            );
+        }
+
+        let mut invalid = Vec::new();
+        let mut missing = provider.clone();
+        missing.credentials.clear();
+        invalid.push(missing);
+        let mut wrong_region = provider.clone();
+        wrong_region
+            .credentials
+            .insert("region".into(), json!(other_region));
+        invalid.push(wrong_region);
+        let mut wrong_domain = provider.clone();
+        wrong_domain
+            .credentials
+            .insert("domain".into(), json!(other_domain));
+        invalid.push(wrong_domain);
+        let mut wrong_origin = provider.clone();
+        wrong_origin.base_url = format!("https://{other_domain}");
+        invalid.push(wrong_origin);
+        for invalid_provider in invalid {
+            let before = local.requests.lock().len();
+            assert!(
+                run(
+                    &runtime,
+                    &plugin,
+                    region,
+                    input(invalid_provider),
+                    local.scope(),
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                local.requests.lock().len(),
+                before,
+                "cross-region or missing credentials must fail before HTTP"
+            );
+        }
+
+        let sensitive = "connection-response-secret-must-not-leak";
+        let failures = [
+            (401, format!(r#"{{"message":"{sensitive}"}}"#)),
+            (403, format!(r#"{{"message":"{sensitive}"}}"#)),
+            (200, format!("<html>{sensitive}</html>")),
+            (200, json!({"code":123,"msg":sensitive}).to_string()),
+            (
+                200,
+                json!({"code":0,"data":{"Response":{"Data":{"private":sensitive}}}}).to_string(),
+            ),
+            (
+                200,
+                json!({"code":0,"data":{"Response":{"Data":{"Accounts":sensitive}}}}).to_string(),
+            ),
+        ];
+        for (status, body) in failures {
+            local.reply(Reply {
+                status,
+                headers: vec![("content-type".into(), "application/json".into())],
+                chunks: Mutex::new(VecDeque::from([body.into_bytes()])),
+            });
+            let before = local.requests.lock().len();
+            let error = run(
+                &runtime,
+                &plugin,
+                region,
+                input(provider.clone()),
+                local.scope(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(local.requests.lock().len(), before + 1);
+            if status == 401 || status == 403 {
+                assert_eq!(
+                    error.model_error_kind(),
+                    Some(if status == 401 {
+                        AiErrorKind::AuthenticationError
+                    } else {
+                        AiErrorKind::AuthorizationError
+                    })
+                );
+                assert_eq!(error.upstream_status(), Some(status));
+            }
+            assert!(!error.to_string().contains(sensitive));
+            assert!(
+                !error
+                    .diagnostic_message()
+                    .unwrap_or_default()
+                    .contains(sensitive)
+            );
+        }
+        assert_eq!(*local.state.lock(), Some(saved_state));
+        assert_eq!(*local.state_writes.lock(), 0);
+        assert!(local.events.lock().is_empty());
+        assert!(local.replies.lock().is_empty());
+    }
+}
+
 #[tokio::test]
 #[ignore = "build the release wasm32-wasip2 component first"]
 async fn regional_allowance_contract() {
@@ -779,7 +957,10 @@ async fn regional_allowance_contract() {
         let origin = format!("https://{domain}");
         let mut allowed = vec![origin.clone()];
         for declared in &plugin.descriptor().providers[0].network.extra_origins {
-            allowed.push(format!("{}://{}", declared.scheme, declared.host));
+            let stravia_vendor_sdk::OriginHost::Exact(host) = &declared.host else {
+                panic!("WorkBuddy billing requires an exact origin")
+            };
+            allowed.push(format!("{}://{}", declared.scheme, host));
         }
         let local = LocalUpstream::new(&allowed.iter().map(String::as_str).collect::<Vec<_>>());
         let mut provider = snapshot(region, &origin);
@@ -813,6 +994,8 @@ async fn regional_allowance_contract() {
         let OperationOutput::Allowance(result) = output else {
             panic!("expected allowance result")
         };
+        assert!(result.account_label.is_none());
+        assert!(result.billing.is_none());
         assert_eq!(result.allowances.len(), 1);
         assert_eq!(
             result.allowances[0].remaining.as_ref().unwrap().value,
@@ -821,7 +1004,6 @@ async fn regional_allowance_contract() {
         assert_eq!(result.allowances[0].used.as_ref().unwrap().value, "165.84");
         assert_eq!(result.allowances[0].limit.as_ref().unwrap().value, "4981");
         assert_eq!(result.allowances[0].used_percent.as_deref(), Some("3.33"));
-        assert!(result.allowances[0].label.contains("4981"));
         assert_eq!(
             result.allowances[0].remaining.as_ref().unwrap().unit,
             "credits"
@@ -875,7 +1057,6 @@ async fn regional_allowance_contract() {
             panic!("expected paginated allowance")
         };
         assert_eq!(result.allowances.len(), 1);
-        assert!(result.allowances[0].label.contains("210"));
         assert_eq!(result.allowances[0].used.as_ref().unwrap().value, "103");
         assert_eq!(
             result.allowances[0].remaining.as_ref().unwrap().value,
