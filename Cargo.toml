@@ -1,6 +1,6 @@
 [package]
 name = "stravia-vendor-workbuddy"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.99.0"
 license = "MIT"
@@ -12,25 +12,29 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-stravia-vendor-sdk = { path = "../StraviaPlatform/backend/crates/stravia-vendor-sdk" }
-stravia-vendor-common = { path = "../StraviaPlatform/backend/crates/stravia-vendor-common" }
-stravia-runtime-contract = { path = "../StraviaPlatform/backend/crates/stravia-runtime-contract" }
-stravia-protocol-codec = { path = "../StraviaPlatform/backend/crates/stravia-protocol-codec" }
+stravia-vendor-sdk = { git = "https://github.com/Stravia-AI/StraviaPlatform", rev = "83613f4752178e952226fc21a386c3c79a4e3131" }
+stravia-vendor-common = { git = "https://github.com/Stravia-AI/StraviaPlatform", rev = "83613f4752178e952226fc21a386c3c79a4e3131" }
+stravia-runtime-contract = { git = "https://github.com/Stravia-AI/StraviaPlatform", rev = "83613f4752178e952226fc21a386c3c79a4e3131" }
+stravia-protocol-codec = { git = "https://github.com/Stravia-AI/StraviaPlatform", rev = "83613f4752178e952226fc21a386c3c79a4e3131" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 semver = { version = "1", features = ["serde"] }
 base64 = "0.23"
 url = "2"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }
+sha2 = "0.11.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rust_decimal = { version = "1.43", default-features = false, features = ["std"] }
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry-propagator-b3 = "0.33"
 
 [build-dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
-stravia-vendor-runtime = { path = "../StraviaPlatform/backend/crates/stravia-vendor-runtime" }
+stravia-vendor-runtime = { git = "https://github.com/Stravia-AI/StraviaPlatform", rev = "83613f4752178e952226fc21a386c3c79a4e3131" }
 async-trait = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 parking_lot = "0.12"

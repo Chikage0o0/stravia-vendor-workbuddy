@@ -18,6 +18,15 @@ fn valid_id(id: &str) -> bool {
         && !id.chars().any(char::is_control)
 }
 
+fn image_model(row: &Value) -> bool {
+    row.get("tags")
+        .and_then(Value::as_array)
+        .is_some_and(|tags| {
+            tags.iter()
+                .any(|tag| matches!(tag.as_str(), Some("text-to-image" | "image-to-image")))
+        })
+}
+
 fn configured_ids(options: &BTreeMap<String, Value>) -> Result<Vec<&str>, ()> {
     let Some(value) = options.get("model_ids") else {
         return Ok(Vec::new());
@@ -112,6 +121,7 @@ fn load_config(
     region: Region,
     headers: Vec<(String, String)>,
 ) -> Result<Value, PluginError> {
+    // 桌面入口由区域配置固定；响应里的 endpoint 不得重写后续请求或扩大网络权限。
     let response = host.http_start(HttpRequest {
         method: "GET".into(),
         url: format!("{}/v3/config", region.origin()),
@@ -205,9 +215,10 @@ fn paid_lines(config: &Value) -> Result<BTreeMap<String, Value>, PluginError> {
         }
         used_ids.insert(free);
         used_ids.insert(paid);
-        let paid_model = parse_models(std::slice::from_ref(paid_row), "account-config")?
+        let mut paid_model = parse_models(std::slice::from_ref(paid_row), "account-config")?
             .models
             .remove(0);
+        apply_transport_metadata(&mut paid_model.metadata, config);
         pairs.insert(
             free.into(),
             json!({
@@ -315,6 +326,17 @@ fn client_catalog(config: &Value) -> Result<DiscoverResponse, PluginError> {
             }
         }
     }
+    for row in rows.iter().filter(|row| image_model(row)) {
+        let id = row.get("id").and_then(Value::as_str).ok_or_else(|| {
+            common::plugin_error(
+                ErrorKind::upstream_unknown(),
+                "image model catalog entry has no ID",
+            )
+        })?;
+        if seen.insert(id.to_owned()) {
+            selected.push(row);
+        }
+    }
     if selected.is_empty() {
         return Err(common::plugin_error(
             ErrorKind::upstream_unknown(),
@@ -323,6 +345,7 @@ fn client_catalog(config: &Value) -> Result<DiscoverResponse, PluginError> {
     }
     let mut response = parse_models(selected, "account-config")?;
     for model in &mut response.models {
+        apply_transport_metadata(&mut model.metadata, config);
         if let Some(line) = pairs.get(&model.id) {
             if let Some(name) = line
                 .get("displayName")
@@ -337,6 +360,28 @@ fn client_catalog(config: &Value) -> Result<DiscoverResponse, PluginError> {
         }
     }
     Ok(response)
+}
+
+/// 仅传播官方配置中存在且类型正确的传输属性，不写入私有状态。
+fn apply_transport_metadata(metadata: &mut BTreeMap<String, Value>, config: &Value) {
+    if let Some(deployment) = config.get("deploymentType").and_then(Value::as_str) {
+        metadata.insert("workbuddy_deployment_type".into(), json!(deployment));
+    }
+    if let Some(disable_optimization) = config
+        .pointer("/productFeatures/DisableYuanbaoChannel")
+        .and_then(Value::as_bool)
+    {
+        metadata.insert(
+            "workbuddy_disable_model_optimization".into(),
+            json!(disable_optimization),
+        );
+    }
+    if let Some(gzip) = config
+        .pointer("/productFeatures/RequestBodyGzip")
+        .and_then(Value::as_bool)
+    {
+        metadata.insert("workbuddy_request_body_gzip".into(), json!(gzip));
+    }
 }
 
 /// 官方客户端的关思考判定：`onlyReasoning` 的模型恒推理；否则仅当
@@ -410,7 +455,23 @@ fn parse_models<'a>(
         if !limit.is_empty() {
             metadata.insert("limit".into(), Value::Object(limit));
         }
-        if let Some(images) = row.get("supportsImages").and_then(Value::as_bool) {
+        let image = image_model(row);
+        if image {
+            let references = row
+                .get("tags")
+                .and_then(Value::as_array)
+                .is_some_and(|tags| {
+                    tags.iter()
+                        .any(|tag| tag.as_str() == Some("image-to-image"))
+                });
+            metadata.insert(
+                "modalities".into(),
+                json!({
+                    "input": if references { vec!["text", "image"] } else { vec!["text"] },
+                    "output": ["image"]
+                }),
+            );
+        } else if let Some(images) = row.get("supportsImages").and_then(Value::as_bool) {
             let input = if images {
                 vec!["text", "image"]
             } else {
@@ -443,8 +504,8 @@ fn parse_models<'a>(
             id: id.into(),
             display_name: row.get("name").and_then(Value::as_str).unwrap_or(id).into(),
             family: None,
-            selector: None,
-            capabilities: Vec::new(),
+            selector: image.then(|| id.into()),
+            capabilities: vec![if image { "media_image" } else { "infer" }.into()],
             metadata,
         });
     }
@@ -457,6 +518,39 @@ fn parse_models<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_models_are_discovered_outside_the_chat_agent_without_promoting_vision() {
+        let config = json!({
+            "agents": [{"name":"cli", "tags":["default"], "models":["vision"]}],
+            "models": [
+                {"id":"vision", "supportsImages":true},
+                {"id":"hunyuan-image-v3.0-art", "tags":["text-to-image"]},
+                {"id":"hidden-chat", "supportsImages":true}
+            ]
+        });
+        let response = client_catalog(&config).unwrap();
+        let vision = &response.models[0];
+        assert_eq!(vision.id, "vision");
+        assert_eq!(vision.capabilities, ["infer"]);
+        assert_eq!(
+            vision.metadata["modalities"],
+            json!({"input":["text","image"], "output":["text"]})
+        );
+        let image = &response.models[1];
+        assert_eq!(image.id, "hunyuan-image-v3.0-art");
+        assert_eq!(image.capabilities, ["media_image"]);
+        assert_eq!(
+            image.metadata["modalities"],
+            json!({"input":["text"], "output":["image"]})
+        );
+        assert!(
+            !response
+                .models
+                .iter()
+                .any(|model| model.id == "hidden-chat")
+        );
+    }
 
     #[test]
     fn rejects_ambiguous_model_configuration() {

@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use semver::Version;
 use stravia_vendor_sdk::{
     AuthDescriptor, AuthFlow, CANONICAL_FORMAT_VERSION, Capability, ChannelDescriptor, ConfigField,
-    ConfigFieldKind, DataCompatibility, NetworkDeclaration, OriginDeclaration, ProviderDescriptor,
-    VendorDescriptor, VendorKind,
+    ConfigFieldKind, DataCompatibility, NetworkDeclaration, OriginDeclaration, OriginHost,
+    ProviderDescriptor, VendorDescriptor, VendorKind,
 };
 
 use crate::{Region, VENDOR_ID, messages};
@@ -12,6 +12,7 @@ use crate::{Region, VENDOR_ID, messages};
 pub(crate) fn descriptor() -> VendorDescriptor {
     let capabilities = BTreeSet::from([
         Capability::Infer,
+        Capability::MediaImage,
         Capability::AuthOauth,
         Capability::ModelDiscovery,
         Capability::Allowance,
@@ -77,29 +78,16 @@ pub(crate) fn descriptor() -> VendorDescriptor {
                 max_length: None,
                 pattern: None,
                 visible_when: None,
-            }, ConfigField {
-                key: "model_ids".into(),
-                label: messages::model_ids(),
-                description: Some(messages::model_ids_description()),
-                kind: ConfigFieldKind::String { multiline: true },
-                required: false,
-                default_json: None,
-                group: None,
-                secret: false,
-                min: None,
-                max: None,
-                max_length: Some(16384),
-                pattern: None,
-                visible_when: None,
             }],
-            // 国内额度属于独立计费域名；聊天与国际额度仍使用各自连接 origin。
             network: NetworkDeclaration {
                 extra_origins: vec![OriginDeclaration {
                     scheme: "https".into(),
-                    host: "www.codebuddy.cn".into(),
+                    host: OriginHost::Regex {
+                        regex: crate::media_generation::IMAGE_CDN_HOST_REGEX.into(),
+                    },
                     port: None,
                 }],
-                ..NetworkDeclaration::default()
+                ..Default::default()
             },
             data_compat: DataCompatibility::default(),
         }],

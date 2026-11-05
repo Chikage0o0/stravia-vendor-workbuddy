@@ -15,11 +15,12 @@ use stravia_runtime_contract::protocol::ids::ProtocolEndpoint;
 use stravia_runtime_contract::protocol::ir::AiRequest;
 use stravia_vendor_common::common;
 use stravia_vendor_sdk::{
-    AiErrorKind, AiStreamDelta, ErrorKind, GuestHost, HttpRequest, HttpResponse, ModelMetadata,
-    OperationOutput, PluginError, ProviderSnapshot, read_http_body,
+    AiErrorKind, AiStreamDelta, ErrorKind, GuestHost, HttpCompression, HttpContentCoding,
+    HttpRequest, HttpResponse, ModelMetadata, OperationOutput, PluginError, ProviderSnapshot,
+    read_http_body,
 };
 
-use crate::{PROTOCOL, Region, auth};
+use crate::{PROTOCOL, Region, auth, request_context::RequestContext};
 
 /// 网关固定的对话补全路径。
 const CHAT_PATH: &str = "/v2/chat/completions";
@@ -57,6 +58,7 @@ pub(crate) fn execute(
         == Some(true);
     request.stream.enabled = true;
     let mut first_auth_headers = Some(auth::inference_headers(provider, region)?);
+    let context = RequestContext::new(host, provider);
     let mut pair = if enabled {
         provider
             .model_metadata
@@ -140,14 +142,12 @@ pub(crate) fn execute(
         let retry_request = (enabled && !paid && attempt == 0).then(|| request.clone());
         let encoded = common::encode_inference_request(PROTOCOL, request)?;
         let mut body = encoded.body;
-        normalize_request_body(
-            &mut body,
-            if paid {
-                paid_metadata.as_ref()
-            } else {
-                provider.model_metadata.as_ref()
-            },
-        );
+        let metadata = if paid {
+            paid_metadata.as_ref()
+        } else {
+            provider.model_metadata.as_ref()
+        };
+        normalize_request_body(&mut body, metadata);
         retain_cli_body(&mut body);
         let body = serde_json::to_vec(&body).map_err(|error| {
             common::plugin_error(
@@ -161,17 +161,20 @@ pub(crate) fn execute(
             None => auth::inference_headers(provider, region)?,
         };
         set_header(&mut headers, "accept", "application/json");
-        apply_session_headers(&mut headers, provider);
+        context.apply(&mut headers);
         retain_cli_headers(&mut headers);
         if attempt == 0 {
             host.emit_started()?;
         }
-        let response = host.http_start(HttpRequest {
-            method: "POST".into(),
-            url: format!("{}{CHAT_PATH}", region.origin()),
-            headers,
-            body,
-        })?;
+        let response = host.http_start_with_compression(
+            HttpRequest {
+                method: "POST".into(),
+                url: format!("{}{CHAT_PATH}", region.origin()),
+                headers,
+                body,
+            },
+            chat_compression(provider.model_metadata.as_ref()),
+        )?;
         let mut rate_limit = None;
         let mut deferred_deltas = Vec::new();
         let result = decode_attempt(
@@ -346,6 +349,18 @@ fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
     headers.push((name.to_owned(), value.to_owned()));
 }
 
+/// 压缩属于产品配置快照，不随免费/付费模型切换；编码和传输头由宿主独占。
+fn chat_compression(metadata: Option<&ModelMetadata>) -> HttpCompression {
+    let gzip = metadata
+        .and_then(|metadata| metadata.extensions.get("workbuddy_request_body_gzip"))
+        .and_then(Value::as_bool)
+        != Some(false);
+    HttpCompression {
+        request: gzip.then_some(HttpContentCoding::Gzip),
+        response: Vec::new(),
+    }
+}
+
 /// 来自官方 CLI 的默认传输头、身份拦截器、会话与 OTel 注入器。
 /// 不允许自定义透传配置扩大集合；认证值仍由插件自己的区域凭据产生。
 fn retain_cli_headers(headers: &mut Vec<(String, String)>) {
@@ -354,8 +369,20 @@ fn retain_cli_headers(headers: &mut Vec<(String, String)>) {
         "accept",
         "authorization",
         "user-agent",
+        "x-stainless-lang",
+        "x-stainless-package-version",
+        "x-stainless-os",
+        "x-stainless-arch",
+        "x-stainless-runtime",
+        "x-stainless-runtime-version",
+        "x-stainless-retry-count",
+        "x-stainless-timeout",
         "x-requested-with",
         "x-agent-purpose",
+        "x-agent-intent",
+        "x-agent-type",
+        "x-private-data",
+        "x-userinfo",
         "x-ide-name",
         "x-ide-type",
         "x-ide-version",
@@ -365,68 +392,26 @@ fn retain_cli_headers(headers: &mut Vec<(String, String)>) {
         "x-enterprise-id",
         "x-tenant-id",
         "x-request-id",
+        "x-root-request-id",
         "x-conversation-id",
         "x-conversation-message-id",
         "x-conversation-request-id",
         "baggage",
         "traceparent",
+        "tracestate",
         "x-trace-id",
+        "b3",
         "x-b3-traceid",
         "x-b3-spanid",
+        "x-b3-parentspanid",
         "x-b3-sampled",
+        "acp-connection-id",
     ];
     headers.retain(|(key, _)| {
         ALLOWED
             .iter()
             .any(|allowed| key.eq_ignore_ascii_case(allowed))
     });
-}
-
-/// 官方客户端为推理请求注入的会话链与 OTel 传播标头。
-///
-/// `X-Conversation-ID` 是上游网关做前缀缓存亲和的稳定路由键，取宿主按
-/// 本地链路派生的 `operation_metadata.session_affinity`（64 位 hex，同一
-/// 链路各轮不变），不采用客户端自报的 session。缺失时不伪造随机值——
-/// 每请求一枚随机会话键会进一步打散上游的亲和视图，比缺失更差。
-///
-/// 官方线规中 `X-Request-ID` 与 `X-Conversation-Message-ID` 同为每轮
-/// 生成的 messageId，这里共用一枚；轮次级 ID 由插件生成，语义等价。
-fn apply_session_headers(headers: &mut Vec<(String, String)>, provider: &ProviderSnapshot) {
-    let message_id = uuid::Uuid::new_v4().simple().to_string();
-    set_header(headers, "x-request-id", &message_id);
-    set_header(headers, "x-conversation-message-id", &message_id);
-    set_header(
-        headers,
-        "x-conversation-request-id",
-        &uuid::Uuid::new_v4().simple().to_string(),
-    );
-    if let Some(conversation_id) = provider
-        .operation_metadata
-        .get("session_affinity")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-    {
-        set_header(headers, "x-conversation-id", conversation_id);
-        set_header(
-            headers,
-            "baggage",
-            &format!(
-                "codebuddy.session_id={conversation_id},codebuddy.conversation_request_id={message_id}"
-            ),
-        );
-    }
-    // 本地生成根 span 的 W3C/B3 追踪标头；tracestate 没有可传播的入站值，不发。
-    let trace_id = uuid::Uuid::new_v4().simple().to_string();
-    let span_id = uuid::Uuid::new_v4().simple().to_string()[..16].to_owned();
-    set_header(
-        headers,
-        "traceparent",
-        &format!("00-{trace_id}-{span_id}-01"),
-    );
-    set_header(headers, "x-trace-id", &trace_id);
-    set_header(headers, "x-b3-traceid", &trace_id);
-    set_header(headers, "x-b3-spanid", &span_id);
-    set_header(headers, "x-b3-sampled", "1");
 }
 
 /// 编码后请求体的线规修正，逐项对应上游校验错误码：
@@ -527,6 +512,13 @@ fn retain_cli_body(body: &mut Value) {
             retain_fields(tool, &["type", "function"]);
             if let Some(function) = tool.get_mut("function") {
                 retain_fields(function, &["name", "description", "parameters", "strict"]);
+                // 国内/国际官方 BaseTool 均显式关闭 strict；国际 DeepSeek 的原工具集
+                // 在严格模式下持续低缓存命中，故对齐默认值，不修改参数 Schema 或输出格式。
+                if let Some(strict) = function.get_mut("strict") {
+                    *strict = Value::Bool(false);
+                } else if let Some(function) = function.as_object_mut() {
+                    function.insert("strict".into(), Value::Bool(false));
+                }
             }
         }
     }
@@ -1461,7 +1453,7 @@ mod tests {
         );
         assert_eq!(
             body["tools"][0],
-            json!({"type":"function", "function":{"name":"lookup", "parameters":schema, "strict":true}})
+            json!({"type":"function", "function":{"name":"lookup", "parameters":schema, "strict":false}})
         );
         assert_eq!(
             body["response_format"],
@@ -1604,89 +1596,6 @@ mod tests {
         });
         assert!(serialize_deepseek_thinking(&mut body, Some(&meta)));
         assert_eq!(body["reasoning_effort"], "low");
-    }
-
-    fn session_provider(client_headers: &[(&str, &str)]) -> ProviderSnapshot {
-        ProviderSnapshot {
-            provider_id: crate::VENDOR_ID.into(),
-            channel: "cn".into(),
-            base_url: Region::Cn.origin().into(),
-            protocol: PROTOCOL.into(),
-            options: Default::default(),
-            credentials: Default::default(),
-            model: Some("hy4-preview".into()),
-            model_metadata: None,
-            client_headers: client_headers
-                .iter()
-                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-                .collect(),
-            operation_metadata: Default::default(),
-        }
-    }
-
-    fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-        headers
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str())
-    }
-
-    #[test]
-    fn conversation_id_uses_host_session_affinity() {
-        let affinity = "0123456789abcdef".repeat(4);
-        let mut provider = session_provider(&[("session_id", "client-session")]);
-        provider
-            .operation_metadata
-            .insert("session_affinity".into(), Value::String(affinity.clone()));
-        let mut headers = Vec::new();
-        apply_session_headers(&mut headers, &provider);
-        assert_eq!(
-            header_value(&headers, "x-conversation-id"),
-            Some(affinity.as_str())
-        );
-        assert!(
-            header_value(&headers, "baggage")
-                .is_some_and(|v| v.starts_with(&format!("codebuddy.session_id={affinity},")))
-        );
-    }
-
-    #[test]
-    fn conversation_id_absent_without_host_affinity() {
-        // 客户端自报的 session 不作为上游键；宿主未下发时也不伪造——
-        // 随机会话键只会打散上游亲和视图。
-        let provider = session_provider(&[("session_id", "client-session")]);
-        let mut headers = Vec::new();
-        apply_session_headers(&mut headers, &provider);
-        assert!(header_value(&headers, "x-conversation-id").is_none());
-        assert!(header_value(&headers, "baggage").is_none());
-        // 轮次级与追踪标头仍然齐备。
-        assert!(header_value(&headers, "x-conversation-message-id").is_some());
-        assert!(header_value(&headers, "x-conversation-request-id").is_some());
-    }
-
-    #[test]
-    fn request_id_matches_message_id_like_the_official_client() {
-        let provider = session_provider(&[]);
-        let mut headers = Vec::new();
-        apply_session_headers(&mut headers, &provider);
-        let message = header_value(&headers, "x-conversation-message-id").unwrap();
-        assert_eq!(header_value(&headers, "x-request-id"), Some(message));
-    }
-
-    #[test]
-    fn trace_headers_form_a_valid_w3c_pair() {
-        let provider = session_provider(&[]);
-        let mut headers = Vec::new();
-        apply_session_headers(&mut headers, &provider);
-        let traceparent = header_value(&headers, "traceparent").unwrap();
-        let trace_id = header_value(&headers, "x-trace-id").unwrap();
-        assert_eq!(trace_id.len(), 32);
-        assert!(trace_id.bytes().all(|b| b.is_ascii_hexdigit()));
-        let parts: Vec<&str> = traceparent.split('-').collect();
-        assert_eq!(parts.as_slice(), ["00", trace_id, parts[2], "01"]);
-        assert_eq!(parts[2].len(), 16);
-        assert_eq!(header_value(&headers, "x-b3-traceid"), Some(trace_id));
-        assert_eq!(header_value(&headers, "x-b3-spanid"), Some(parts[2]));
     }
 
     #[test]
