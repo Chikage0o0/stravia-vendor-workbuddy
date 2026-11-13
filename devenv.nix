@@ -29,6 +29,7 @@ in
     cmake
     gnumake
     openssl
+    minisign
   ] ++ lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.mold;
 
   languages.c.enable = false;

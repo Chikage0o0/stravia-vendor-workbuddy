@@ -4,10 +4,35 @@
 
 ## 安装与使用
 
-1. 先升级到兼容 Vendor `1.0.0`、Net `1.1.0` 和 State `1.1.0`，且支持组件声明并加载插件自有 egress shape 的 Stravia 宿主。旧宿主不支持 `plugin:workbuddy`，不会回退到旧内建 shape；升级后须重新构建并导入插件。插件通过 Git tag `v0.7.0` 依赖 `StraviaPlatform` 的 SDK crate，构建时由 Cargo 自动拉取，无需本地检出宿主；使用 Rust `1.99.1` 和 `wasm32-wasip2` target。
-2. 执行 `task dist`，在 Stravia 导入生成的 Wasm，并核对出站权限。当前源码版本 `0.5.0` **尚未发布**；不要把本地构建当作已发布 Release。
+1. 先升级到支持插件市场 v2、兼容 Vendor `1.0.0`、Net `1.1.0` 和 State `1.1.0`，且支持组件声明并加载插件自有 egress shape 的 Stravia 宿主。旧宿主不支持 `plugin:workbuddy`，不会回退到旧内建 shape；升级后须重新安装插件。插件通过 Git tag `v0.7.0` 依赖 `StraviaPlatform` 的 SDK crate，构建时由 Cargo 自动拉取，无需本地检出宿主；使用 Rust `1.99.1` 和 `wasm32-wasip2` target。
+2. 发布后可在供应商插件页面添加来源 `https://github.com/Chikage0o0/stravia-vendor-workbuddy`，通过独立渠道核对来源公钥的完整指纹后确认信任，再预览并安装 WorkBuddy、核对出站权限。也可从 [Releases](https://github.com/Chikage0o0/stravia-vendor-workbuddy/releases) 下载 `.wasm.zst` 本地导入；本地导入仍为 unverified，不会自动建立受信任的市场来源。当前源码版本 `0.5.0` **尚未发布**，历史 Release 不含新版目录；不要把本地构建当作已发布 Release。
 3. 创建 WorkBuddy 连接，选择国内或国际 channel，在浏览器完成授权并同步模型。国内账号使用 `https://www.workbuddy.cn`，国际账号使用 `https://www.workbuddy.ai`；凭据按区域隔离，配置响应不会扩大出站权限。若连接来自 CodeBuddy CLI 改版，应改回对应 WorkBuddy 区域地址并重新授权、同步模型；不要假定 CLI 凭据可用于桌面身份。
 4. 在 Stravia 中启用所需模型，再以宿主提供的 OpenAI 兼容入口和访问凭据连接客户端。连接检查只查询受保护的账号资料，不生成内容；成功不代表聊天或生图模型已验证。
+
+首次添加第三方来源是 TOFU：公钥与目录可能经过同一网络路径，必须通过独立渠道核对完整指纹。指纹是 Minisign 公钥 Base64 解码后二进制 payload 的 SHA-256，不是短 key ID 或公钥文本的哈希。目录签名只认证固定公钥对应的发布者，不代表腾讯官方发布、自动安全审查或插件安全；安装前仍须自行评估凭据和网络权限。
+
+### 构建与发布插件目录
+
+需要 Python 3.11+、Task、Minisign、Rust 和 `wasm32-wasip2`。SDK 依赖由 `Cargo.toml` 的 git tag 固定；共享工具 `stravia-tools plugin-catalog` 必须取自同一 Platform tag，或包含该工具且与 `Cargo.lock` 相容的 checkout。已有工具可通过绝对路径使用，不在本仓库复制目录生成实现。[v0.7.0 生成器](https://github.com/Stravia-AI/StraviaPlatform/blob/v0.7.0/backend/crates/stravia-devtools/src/plugin_catalog.rs) 读取真实 descriptor，校验插件身份，生成 level-19 单 frame Zstd 并解压回环；[目录契约](https://github.com/Stravia-AI/StraviaPlatform/blob/v0.7.0/backend/crates/stravia-core/src/plugin/distribution.rs) 定义压缩与原始组件的双摘要、公钥指纹及 32 KiB 图标上限。现有 WorkBuddy 图标已满足上限，无需修改。
+
+本地示例（使用独立、加密的测试密钥；不要把密钥或密码放进仓库）：
+
+```bash
+export STRAVIA_TOOLS=/absolute/path/to/stravia-tools
+export HOST_VERSION_REQ='>=0.7.0, <0.8.0' # 仅为示例，发布前由维护者评估兼容范围
+export REPOSITORY_ID=1389031614 RELEASE_TAG=v0.5.0
+export PUBLISHED_AT=2026-11-10T00:00:00Z
+export PLUGIN_SIGNING_KEY_FILE=/secure/test-minisign.key
+export PLUGIN_PUBLIC_KEY_FILE=/secure/test-minisign.pub
+export PLUGIN_SIGNING_PASSWORD='<test password>'
+task dist
+```
+
+`task dist` 构建组件，调用共享工具生成并验证压缩组件和 v2 目录，再用独立 Minisign 密钥签名、验签，核对压缩资产大小和 SHA-256。输出为 `dist/stravia-vendor-workbuddy-v0.5.0.wasm.zst`、`stravia-plugin-catalog.json`、`stravia-plugin-catalog.json.minisig`、`stravia-plugin-catalog.pub`、`LICENSE`、`NOTICE` 和 `rust_decimal.LICENSE`；不发布原始 `.wasm` 或 `SHA256SUMS`。验签成功后，脚本仅清理旧入口生成的 `dist/stravia-vendor-workbuddy-v*.wasm` 和 `dist/SHA256SUMS`，保留其他用户文件。Release tag 必须与 Cargo 版本一致，时间必须为 RFC 3339，宿主版本范围不得留空。
+
+GitHub 发布前须配置 repository variables `HOST_VERSION_REQ`、`STRAVIA_PLUGIN_CATALOG_PUBLIC_KEY`（完整公钥文本），以及 secrets `STRAVIA_PLUGIN_CATALOG_SIGNING_KEY`（配对的加密私钥文本）、`STRAVIA_PLUGIN_CATALOG_SIGNING_PASSWORD`。目录密钥独立于 Desktop updater；生产密钥须在受控离线环境生成和保管，不得使用测试密钥。
+
+Release workflow 由 `v*` tag 触发，也可在 Run workflow 中填写现有版本标签。它始终检出该标签，并按 `Cargo.toml` 固定的唯一 Platform tag 检出主仓库，仅用于构建共享目录工具；不需要 `STRAVIA_PLATFORM_REF`。工具构建前执行 `patch-crate` 和内建组件构建，与主仓库的准备流程一致。组件构建及现有单元、真实 Wasm 契约测试通过后生成签名资产，按明确的七文件清单创建 draft；`scripts/verify_release.py` 下载实际附件，逐字节比对并验签、核对摘要，成功后才公开。已有同 tag Release 不覆盖，失败保留 draft 供维护者检查处理；历史 Release 不补造目录或签名。构建和本地打包本身不发布、不推送。
 
 ## 模型、费用和状态
 
@@ -74,19 +99,20 @@
 
 ## 本地开发
 
-推荐使用 Nix 与 devenv。`devenv.yaml`、`devenv.lock` 沿用相邻 `StraviaPlatform` 的输入和锁定版本；Rust 版本、开发组件及 Wasm target 统一由 `rust-toolchain.toml` 声明。环境提供 Rust、Clang（Linux 使用 Mold）、Task、Python 3、CMake、pkg-config 和 OpenSSL，不启动数据库或前端服务。构建不再依赖本地宿主源码；仅 `scripts/vendor_alignment.py`、`verify-shape` 等需要宿主工具的流程仍须自行提供 `../StraviaPlatform/` 检出（或通过 `--host-repo`/`STRAVIA_PLATFORM_DIR` 指定），devenv 不会自动检出或修改宿主。
+推荐使用 Nix 与 devenv。`devenv.yaml`、`devenv.lock` 沿用相邻 `StraviaPlatform` 的输入和锁定版本；Rust 版本、开发组件及 Wasm target 统一由 `rust-toolchain.toml` 声明。环境提供 Rust、Clang（Linux 使用 Mold）、Task、Python 3、CMake、pkg-config、OpenSSL 和 Minisign，不启动数据库或前端服务。构建组件不依赖本地宿主源码；`scripts/vendor_alignment.py`、`verify-shape` 等流程仍须自行提供宿主 checkout 或匹配的工具。签名目录打包还须提供上文的 `STRAVIA_TOOLS`、宿主范围和独立签名密钥；devenv 不会自动检出或修改宿主。
 
 ```bash
 devenv shell
 # 可选：配置好 direnv 后执行 direnv allow，由 .envrc 自动加载环境
 ```
 
-进入环境后执行下列命令；也可不进入交互 shell，直接执行 `devenv shell -- task dist`。不用 Nix 时，须自行安装 `rust-toolchain.toml` 指定的工具链及 Task 等所需工具。
+进入环境后执行下列命令；配置好上文的目录工具和签名环境后，也可执行 `devenv shell -- task dist`。不用 Nix 时，须自行安装 `rust-toolchain.toml` 指定的工具链及 Task、Python 3.11+、Minisign 等所需工具。
 
 ```bash
 cargo build --locked --release --lib --target wasm32-wasip2
 # target/wasm32-wasip2/release/stravia_vendor_workbuddy.wasm
 
+# 按上文配置共享工具、宿主范围与独立测试密钥，生成签名目录
 task dist
 # 组件契约测试加载 release Wasm，须先构建
 task test
@@ -98,9 +124,17 @@ STRAVIA_TOOLS=/absolute/path/to/stravia-tools task verify-shape
 
 宿主工具的 `--help` 必须列出 `verify-egress-shape`；旧二进制即使位于当前源码的 `target/` 下也不代表兼容，需要从该宿主源码重新构建。`tests/test_response_code_map.py` 是附加的离线回归，须将 `CORE_RUNNER` 指向包含 `plugin::execution::alignment_tests::response_code_map_probe` 的已构建 Core 单元测试可执行文件，再运行 `python3 -m unittest discover -s tests -p test_response_code_map.py -v`；未设置运行器时这两项测试会跳过，不计作验证通过。
 
-`task dist` 将当前版本组件、`LICENSE`、`NOTICE`、`rust_decimal.LICENSE` 和 `SHA256SUMS` 写入 `dist/`；本地校验可执行 `(cd dist && sha256sum -c SHA256SUMS)`。`dist/`、`target/`、devenv/direnv 状态和 Python 缓存不提交，共享环境配置、锁文件、采集脚本和脱敏 fixture 需要提交。不要提交 `.env` 或真实凭据；可提交不含秘密的 `.env.example`。
+`task dist` 的资产与签名配置见上文；本地验签可执行 `minisign -V -p dist/stravia-plugin-catalog.pub -m dist/stravia-plugin-catalog.json`，首次信任仍须独立核对完整公钥指纹。`dist/`、`target/`、devenv/direnv 状态和 Python 缓存不提交，共享环境配置、锁文件、采集脚本和脱敏 fixture 需要提交。不要提交 `.env` 或真实凭据；可提交不含秘密的 `.env.example`。
 
-升级宿主不会替换已安装的独立组件；须重新构建并导入。历史 `v0.4.0` 插件附件的 SHA-256 为 `0c2d7982eaa9f7dee7e67541ff96150574515af5d7d2bd604f9dc449c23405bd`；它不是 WorkBuddy 安装包或 `v0.5.0` 的哈希，当前构建的摘要以 `dist/SHA256SUMS` 为准。
+升级宿主不会替换已安装的独立组件；须重新安装。历史 `v0.4.0` 插件附件的 SHA-256 为 `0c2d7982eaa9f7dee7e67541ff96150574515af5d7d2bd604f9dc449c23405bd`；它不是 WorkBuddy 安装包或 `v0.5.0` 的哈希。新版压缩与组件摘要以验签后的插件目录为准，历史 Release 的 `SHA256SUMS` 仅适用于其旧附件。
+
+## 变更记录
+
+### 0.5.0（未发布）
+
+- 接入插件市场 v2：通过固定 Platform tag 的共享工具生成单 frame Zstd 与双摘要目录，使用独立 Minisign 密钥签名并分发公钥，不再发布原始 Wasm 与 `SHA256SUMS`。
+- 发布工作流要求显式宿主兼容范围和签名配置；创建 draft 后下载校验精确资产、签名与摘要，成功才公开，已有 Release 不覆盖。支持按现有标签手动触发。
+- 本地开发环境增加 Minisign；打包在验签成功后清理旧原始组件与校验清单，保留其他用户文件。未修改推理、认证或网络权限。
 
 ## License
 

@@ -1,12 +1,14 @@
 name: Release
 
-# 打 v* tag 时构建 wasm32-wasip2 组件并发布 GitHub Release。
-# tag 版本号必须与 Cargo.toml 的 package.version 一致，否则失败。
-
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "待发布的现有版本标签"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -14,16 +16,67 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: source/stravia-vendor-workbuddy
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      HOST_VERSION_REQ: ${{ vars.HOST_VERSION_REQ }}
+      REPOSITORY_ID: ${{ github.repository_id }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          path: source/stravia-vendor-workbuddy
 
-      # rust-toolchain.toml 是工具链版本的唯一来源
+      - name: Validate release and resolve Platform tag
+        id: platform
+        run: |
+          set -euo pipefail
+          test -n "$HOST_VERSION_REQ" || { echo '::error::HOST_VERSION_REQ is required'; exit 1; }
+          test "$REPOSITORY_ID" = 1389031614 || { echo '::error::Wrong repository'; exit 1; }
+          python3 - <<'PY'
+          import os
+          import tomllib
+
+          with open('Cargo.toml', 'rb') as f:
+              manifest = tomllib.load(f)
+          expected_tag = 'v' + manifest['package']['version']
+          if os.environ['RELEASE_TAG'] != expected_tag:
+              raise SystemExit(f'::error::Release tag must match Cargo.toml version: {expected_tag}')
+
+          platform_url = 'https://github.com/Stravia-AI/StraviaPlatform'
+          dependencies = []
+          def visit(value):
+              if isinstance(value, dict):
+                  if value.get('git', '').removesuffix('.git').rstrip('/') == platform_url:
+                      dependencies.append(value)
+                  for child in value.values():
+                      visit(child)
+              elif isinstance(value, list):
+                  for child in value:
+                      visit(child)
+          visit(manifest)
+          tags = {dep.get('tag') for dep in dependencies}
+          if not dependencies or len(tags) != 1 or not all(isinstance(tag, str) and tag and not any(c.isspace() for c in tag) for tag in tags):
+              raise SystemExit('::error::StraviaPlatform dependencies must all specify the same nonempty tag')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+              print(f'ref={tags.pop()}', file=f)
+          PY
+
+      - name: Checkout catalog tool from the pinned Platform tag
+        uses: actions/checkout@v4
+        with:
+          repository: Stravia-AI/StraviaPlatform
+          ref: ${{ steps.platform.outputs.ref }}
+          path: source/StraviaPlatform
+
       - name: Read rust-toolchain.toml
         id: toolchain
-        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+        run: echo "channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')" >> "$GITHUB_OUTPUT"
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: wasm32-wasip2
@@ -31,32 +84,58 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: wasm32-wasip2
+          workspaces: |
+            source/stravia-vendor-workbuddy -> target
+            source/StraviaPlatform -> target
 
-      - name: Check tag matches Cargo.toml version
+      - name: Install catalog dependencies
         run: |
-          tag="${GITHUB_REF_NAME#v}"
-          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          echo "tag=$tag version=$version"
-          test "$tag" = "$version" || { echo "::error::tag $tag does not match Cargo.toml version $version"; exit 1; }
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends minisign cmake clang libclang-dev pkg-config libssl-dev
 
-      - name: Build wasm component
-        run: cargo build --locked --release --lib --target wasm32-wasip2
-
-      - name: Verify unit and component contracts
+      - name: Build and verify component
         run: |
+          cargo build --locked --release --lib --target wasm32-wasip2
           cargo test --locked --lib
           cargo test --locked --test component_contract -- --ignored --nocapture
 
-      - name: Package dist
+      - name: Build shared catalog tool
+        working-directory: source/StraviaPlatform
         run: |
-          name="stravia-vendor-workbuddy-v${GITHUB_REF_NAME#v}.wasm"
-          mkdir -p dist
-          cp target/wasm32-wasip2/release/stravia_vendor_workbuddy.wasm "dist/$name"
-          cp LICENSE NOTICE vendor/rust_decimal.LICENSE dist/
-          (cd dist && sha256sum "$name" > SHA256SUMS && cat SHA256SUMS)
+          cargo install --locked --version 0.1.13 patch-crate
+          cargo patch-crate --force
+          cargo run --locked -p stravia-vendor-base --bin stravia-build-vendors
+          cargo build --locked --release -p stravia-devtools --bin stravia-tools
 
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: dist/*
+      - name: Generate and sign distribution
+        env:
+          SIGNING_KEY: ${{ secrets.STRAVIA_PLUGIN_CATALOG_SIGNING_KEY }}
+          PLUGIN_SIGNING_PASSWORD: ${{ secrets.STRAVIA_PLUGIN_CATALOG_SIGNING_PASSWORD }}
+          PUBLIC_KEY: ${{ vars.STRAVIA_PLUGIN_CATALOG_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$SIGNING_KEY" && test -n "$PLUGIN_SIGNING_PASSWORD" && test -n "$PUBLIC_KEY"
+          umask 077
+          keydir=$(mktemp -d)
+          trap 'rm -rf "$keydir"' EXIT
+          printf '%s\n' "$SIGNING_KEY" > "$keydir/key"
+          printf '%s\n' "$PUBLIC_KEY" > "$keydir/pub"
+          export PLUGIN_SIGNING_KEY_FILE="$keydir/key" PLUGIN_PUBLIC_KEY_FILE="$keydir/pub"
+          export STRAVIA_TOOLS="$GITHUB_WORKSPACE/source/StraviaPlatform/target/release/stravia-tools"
+          PUBLISHED_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          export PUBLISHED_AT
+          python3 scripts/dist.py
+
+      - name: Create draft with exact assets
+        run: |
+          set -euo pipefail
+          asset="dist/stravia-vendor-workbuddy-${RELEASE_TAG}.wasm.zst"
+          gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes \
+            "$asset" dist/stravia-plugin-catalog.json \
+            dist/stravia-plugin-catalog.json.minisig dist/stravia-plugin-catalog.pub \
+            dist/LICENSE dist/NOTICE dist/rust_decimal.LICENSE
+
+      - name: Verify uploaded draft and publish
+        run: |
+          python3 scripts/verify_release.py
+          gh release edit "$RELEASE_TAG" --draft=false
