@@ -5,11 +5,13 @@
 ## 安装与使用
 
 1. 先升级到支持插件市场 v2、兼容 Vendor `1.0.0`、Net `1.1.0` 和 State `1.1.0`，且支持组件声明并加载插件自有 egress shape 的 Stravia 宿主。旧宿主不支持 `plugin:workbuddy`，不会回退到旧内建 shape；升级后须重新安装插件。插件通过 Git tag `v0.7.0` 依赖 `StraviaPlatform` 的 SDK crate，构建时由 Cargo 自动拉取，无需本地检出宿主；使用 Rust `1.99.1` 和 `wasm32-wasip2` target。
-2. 发布后可在供应商插件页面添加来源 `https://github.com/Chikage0o0/stravia-vendor-workbuddy`，通过独立渠道核对来源公钥的完整指纹后确认信任，再预览并安装 WorkBuddy、核对出站权限。也可从 [Releases](https://github.com/Chikage0o0/stravia-vendor-workbuddy/releases) 下载 `.wasm.zst` 本地导入；本地导入仍为 unverified，不会自动建立受信任的市场来源。当前源码版本 `0.5.0` **尚未发布**，历史 Release 不含新版目录；不要把本地构建当作已发布 Release。
+2. 在供应商插件页面添加来源 `https://github.com/Chikage0o0/stravia-vendor-workbuddy`，通过独立渠道核对来源公钥的完整指纹后确认信任，再预览并安装 WorkBuddy、核对出站权限。也可从 [Releases](https://github.com/Chikage0o0/stravia-vendor-workbuddy/releases) 下载 `.wasm.zst` 本地导入；本地导入仍为 unverified，不会自动建立受信任的市场来源。当前版本为 `0.5.0`；`v0.4.0` 及更早 Release 不含新版目录与签名。
 3. 创建 WorkBuddy 连接，选择国内或国际 channel，在浏览器完成授权并同步模型。国内账号使用 `https://www.workbuddy.cn`，国际账号使用 `https://www.workbuddy.ai`；凭据按区域隔离，配置响应不会扩大出站权限。若连接来自 CodeBuddy CLI 改版，应改回对应 WorkBuddy 区域地址并重新授权、同步模型；不要假定 CLI 凭据可用于桌面身份。
 4. 在 Stravia 中启用所需模型，再以宿主提供的 OpenAI 兼容入口和访问凭据连接客户端。连接检查只查询受保护的账号资料，不生成内容；成功不代表聊天或生图模型已验证。
 
 首次添加第三方来源是 TOFU：公钥与目录可能经过同一网络路径，必须通过独立渠道核对完整指纹。指纹是 Minisign 公钥 Base64 解码后二进制 payload 的 SHA-256，不是短 key ID 或公钥文本的哈希。目录签名只认证固定公钥对应的发布者，不代表腾讯官方发布、自动安全审查或插件安全；安装前仍须自行评估凭据和网络权限。
+
+本来源目录签名公钥的完整 SHA-256 指纹为 `7c8ded592479ebb5a72abd6cc0f8c91dea80313eb789bea14131ba2bc49fe5c6`；首次信任前仍须通过独立渠道核对。
 
 ### 构建与发布插件目录
 
@@ -130,11 +132,13 @@ STRAVIA_TOOLS=/absolute/path/to/stravia-tools task verify-shape
 
 ## 变更记录
 
-### 0.5.0（未发布）
+### 0.5.0（2026-11-13）
 
+- Stravia SDK、运行时与协议依赖固定到上游 `v0.7.0` Release tag，构建组件不再依赖本地宿主目录。
+- 对齐 Stravia `v0.7.0` 的传输与状态契约，组件声明独立 WorkBuddy egress shape；更新国内、国际客户端身份与冷连接 fixture。
 - 接入插件市场 v2：通过固定 Platform tag 的共享工具生成单 frame Zstd 与双摘要目录，使用独立 Minisign 密钥签名并分发公钥，不再发布原始 Wasm 与 `SHA256SUMS`。
 - 发布工作流要求显式宿主兼容范围和签名配置；创建 draft 后下载校验精确资产、签名与摘要，成功才公开，已有 Release 不覆盖。支持按现有标签手动触发。
-- 本地开发环境增加 Minisign；打包在验签成功后清理旧原始组件与校验清单，保留其他用户文件。未修改推理、认证或网络权限。
+- 本地开发环境增加 Minisign；打包在验签成功后清理旧原始组件与校验清单，保留其他用户文件。
 
 ## License
 
