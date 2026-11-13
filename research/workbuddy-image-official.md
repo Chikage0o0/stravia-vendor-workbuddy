@@ -2,6 +2,24 @@
 
 调查日期：2026-10-18。仅检索、阅读官方公开产品文档和更新说明；未登录、未读取凭据、未实际生成图片或触发计费。所读文档页面标注构建日期为 2026-10-16。下列模型名称保留官方原文，不等同于已确认的 API model ID。
 
+## 桌面发行物补充（2026-11-09）
+
+[腾讯云 WorkBuddy 产品页](https://cloud.tencent.com/act/pro/workbuddy) 将 WorkBuddy 与 CodeBuddy 分别列为产品；[WorkBuddy 官方历史下载页](https://www.workbuddy.cn/docs/workbuddy/Download-History) 列出国内 SaaS Windows x64、macOS Apple 芯片和 Intel 安装包，未据此证明 Linux 桌面版。该页列 `v5.9.3` 发布于 2026-10-27，三个平台的文件名均带 `5.9.3.42398134-d4692421`。这是文件名中的发行标识，不可称为 SHA-256；该归档页面未列文件 SHA-256，以下 ZIP 校验来自另行核验的更新元数据和发行包。
+
+后续静态发行包核验：国内 macOS ARM64 `5.9.3.42398134` ZIP 的 SHA-256 为 `55d73c63e44be58e31411254d10ad141faef9fd9eaf3cab67685d81f88e14835`，与[官方更新元数据](https://www.workbuddy.cn/v2/update?platform=workbuddy-darwin-arm64)一致；内嵌 CLI `2.165.0`、Electron `37.10.3`。国际 macOS `5.9.4.42593613` ZIP 的实测 SHA-256 为 `754926260c0ab867b5fe1050ab5cc01724a1330451617c8f339c679ff3bbc542`，与[官方元数据](https://www.workbuddy.ai/v2/update?platform=workbuddy-darwin-arm64)的 `6502dc77a0d931dc5b6c490dea20b5966bab0c5c64fea65938ecb15e4a5fbea6` 不匹配，原因未知，不能视为摘要验证通过。国内旧版 Linux x64 DEB `5.6.2.40046327` 的 SHA-256 `12149ad8c0cd748fd5062d8f62c7827d688d8095427ada99b1ae9e7019897523` 与[官方元数据](https://www.workbuddy.cn/v2/update?platform=workbuddy-linux-x64-deb)一致；其静态文件包含 Electron `37.10.3`、Node `22.22.2`，但没有证明运行时 Node 版本或当前网络行为。上述发行包的静态核验本身未捕获桌面 TLS/ClientHello。另一次隔离采集使用 Windows 官方 WorkBuddy `5.9.3` bundle 的 Electron Node，经 Wine、临时 CA 和合成 ACP 请求捕获同 socket ClientHello；不提供桌面 `CLIENT_INFO` 的新连接 JA3 `71dc8c533dd919ae9f4963224a4ba8fd`、JA4 `t13d181000_5d04281c6031_78e6aca7449b`。补齐桌面 `CLIENT_INFO` 并禁用服务端 ticket 的冷连接采集中，第 4 个请求带 21 个工具与 Agent purpose `conversation` / type `main`，为主推理，JA3 / JA4 与该新连接样本相同；第 2 个请求无工具，不能据此断定为主推理。补齐桌面 `CLIENT_INFO` 的另一次采集产生两个推理请求，UA 为 `WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0`，使用 gzip；PSK session resumption 的 JA3 为 `d76a5a80b4bb0c75ac45782b0b53da91`、JA4 为 `t13d181100_5d04281c6031_d5fe2c511efa`，与新连接样本不可混同。这不等于官方桌面 GUI 运行或真实上游成功。
+
+两区 fresh 冷连接主推理再次采集均观察到 `Accept-Encoding: gzip, compress, deflate, br`，顺序位于 `Content-Length` 后、`Host` 前。插件声明该值并请求宿主 gzip/deflate/br 解码；Net 1.1 不支持 `compress`，服务端选用时明确失败，不代表完整支持该列表。国际桌面的 `productName` 按打包 resolver fallback 为 `WorkBuddy`，UA 的 `applicationName` 为 `workbuddy-ai`，不应以 CLI 展示名代替。
+
+### 内嵌 HTTP 响应解码源码边界
+
+国内 Windows `5.9.3` 和国际 Windows `5.9.4` 安装包的 `resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs` 含相同 Axios HTTP 适配器实现；以下偏移是 UTF-8 解码后的零起算字符位置，不是字节偏移。约 `9654080` 构造 `gzip, compress, deflate`，Brotli 可用时加 `br`；约 `9665895` 的响应 `content-encoding` switch 将 `gzip`、`x-gzip`、`compress`、`x-compress` 都送入 `eZ.createUnzip(ta)`，`deflate` 先经 `new te` 再送入 `createUnzip`，`br` 则在可用时走 `createBrotliDecompress(ts)`。这些是适配器的静态分支，不代表所有客户端请求都必经该路径。
+
+[Node.js v22 zlib 文档](https://nodejs.org/docs/latest-v22.x/api/zlib.html#compressing-http-requests-and-responses)将 `createUnzip()` 描述为处理 gzip 和 deflate；该 API 未声明支持 Unix compress/LZW。因此 `compress` / `x-compress` 名称被 switch 接受，不能证明真正 LZW 流可被解码；也不能由此声称插件 Net 1.1 支持它。插件目前对服务端选择的 `compress` 明确失败，gzip、deflate、br 交由宿主处理。本次没有向官方客户端发送压缩响应验证具体运行时错误或端到端行为。
+
+国际 Windows 官方 `5.9.4` 安装包的更新 API 摘要为空，一次下载的本地 SHA-256 为 `6ff4be433d664ad14c88210b5b82ebb3674d7047aab8ae52459006c587be2ee0`，不能称为官方摘要匹配。`osslsigncode` 验证签名链、时间戳及签名者和 TSA CRL 成功；签名主体 Tencent Technology (Shenzhen) Company Limited，根 DigiCert Trusted Root G4。国内包同主体、中间和根，但叶证书及公钥不同，不是相同证书 pin；该国际包内 CLI 为 `2.165.0`。
+
+仓库历史资料曾对照国内 WorkBuddy `5.8.3` 与国际 WorkBuddy AI `5.8.4`，均记载内嵌 CLI `2.161.0`；国际 [5.8.4 包](https://download.codebuddy.ai/workbuddy/saas/darwin-arm64/WorkBuddy-darwin-arm64-5.8.4.41366630-73952edb.zip) 的文件名标识为 `41366630-73952edb`。这是历史记录而非本次实测，文件 SHA-256 未确认。官方归档的新版本、历史桌面版本与独立 CodeBuddy npm CLI 不是同一版本轨迹；不从产品页面推断桌面请求线规、账号模型或授权兼容性。
+
 ## 结论
 
 1. **有产品级 AI 生图能力，不只是图片输入。** 国内 WorkBuddy《设计创意（WorkBuddy × Ardot）》明确提供“AI 生图”素材处理选项，可根据场景自动生成图片；同时支持海报、Banner、Logo、PPT 等设计稿。注意：设计稿生成、画布修改和栅格图像生成不是同一个概念，本结论依据明确的“AI 生图”选项，而不是单凭“海报”营销描述。[设计创意官方教程](https://www.workbuddy.cn/docs/workbuddy/From-Beginner-to-Expert-Guide/Function-Description/Design-Idea)

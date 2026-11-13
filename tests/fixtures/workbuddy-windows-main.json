@@ -1,0 +1,385 @@
+{
+  "provenance": {
+    "product_version": "5.9.3",
+    "cli_version": "2.165.0",
+    "exe_sha256": "bbf504003825e0e22dd8c401b396d79db78ec603558088565d1b2e81561704a0",
+    "entry_sha256": "8df0f1c7bc6535e5df0b626450228241d874867023adb6c9c8f7b1a882590bf4",
+    "client": "WorkBuddy Windows desktop embedded CLI",
+    "mode": "--serve ACP with desktop CLIENT_INFO environment",
+    "captured_at": "2026-11-08T18:43:48.063507+00:00",
+    "capture_script": "stravia-vendor-workbuddy/scripts/capture_official_wine.py",
+    "request_order": 4,
+    "connection_order": 4,
+    "operation": "POST /v2/chat/completions",
+    "selection": "Main prompt marker, 21 tools, X-Agent-Type main and X-Agent-Purpose conversation",
+    "trust": "Synthetic account, loopback-only network namespace, temporary local CA; server disables tickets to obtain a fresh main-request ClientHello",
+    "limitations": "Official binary and native desktop launch context; not a desktop GUI session or successful real upstream request. Random values, keys, tickets and private header values are not retained.",
+    "additional_captures": [
+      {
+        "product_version": "5.9.4",
+        "cli_version": "2.165.0",
+        "exe_sha256": "15880ca7859f417bf8a6a639bacd1da6b63ced83fbead710317dad38b8f6fcc8",
+        "entry_sha256": "8df0f1c7bc6535e5df0b626450228241d874867023adb6c9c8f7b1a882590bf4",
+        "desktop_product_name": "WorkBuddy",
+        "desktop_product_name_source": "desktop_fallback",
+        "region": "intl",
+        "request_order": 4,
+        "connection_order": 4,
+        "complete_clienthello_equals_primary": true,
+        "tools_count": 22,
+        "trust": "Official HTTPS Windows distribution; Authenticode signer chain, timestamp and revocation verification; official checksum absent"
+      }
+    ]
+  },
+  "clienthello": {
+    "legacy_version": 771,
+    "cipher_suites": [
+      4865,
+      4866,
+      4867,
+      49199,
+      49195,
+      49200,
+      49196,
+      49191,
+      52393,
+      52392,
+      49161,
+      49171,
+      49162,
+      49172,
+      156,
+      157,
+      47,
+      53
+    ],
+    "extensions": [
+      0,
+      23,
+      65281,
+      10,
+      11,
+      35,
+      13,
+      51,
+      45,
+      43
+    ],
+    "extension_details": [
+      {
+        "type": 0,
+        "length": 21,
+        "decoded": {
+          "server_name_present": true
+        }
+      },
+      {
+        "type": 23,
+        "length": 0,
+        "decoded": {
+          "extended_master_secret": true
+        }
+      },
+      {
+        "type": 65281,
+        "length": 1,
+        "decoded": {
+          "renegotiation_info": true
+        }
+      },
+      {
+        "type": 10,
+        "length": 8,
+        "decoded": {
+          "groups": [
+            29,
+            23,
+            24
+          ]
+        }
+      },
+      {
+        "type": 11,
+        "length": 2,
+        "decoded": {
+          "point_formats": [
+            0
+          ]
+        }
+      },
+      {
+        "type": 35,
+        "length": 0,
+        "decoded": null
+      },
+      {
+        "type": 13,
+        "length": 20,
+        "decoded": {
+          "algorithms": [
+            1027,
+            2052,
+            1025,
+            1283,
+            2053,
+            1281,
+            2054,
+            1537,
+            513
+          ]
+        }
+      },
+      {
+        "type": 51,
+        "length": 38,
+        "decoded": {
+          "groups": [
+            29
+          ],
+          "shares": [
+            {
+              "group": 29,
+              "length": 32
+            }
+          ]
+        }
+      },
+      {
+        "type": 45,
+        "length": 2,
+        "decoded": {
+          "psk_key_exchange_modes": [
+            1
+          ]
+        }
+      },
+      {
+        "type": 43,
+        "length": 5,
+        "decoded": {
+          "versions": [
+            772,
+            771
+          ]
+        }
+      }
+    ],
+    "supported_groups": [
+      29,
+      23,
+      24
+    ],
+    "ec_point_formats": [
+      0
+    ],
+    "signature_algorithms": [
+      1027,
+      2052,
+      1025,
+      1283,
+      2053,
+      1281,
+      2054,
+      1537,
+      513
+    ],
+    "signature_algorithms_cert": [],
+    "certificate_compression": [],
+    "supported_versions": [
+      772,
+      771
+    ],
+    "key_share_groups": [
+      29
+    ],
+    "key_shares": [
+      {
+        "group": 29,
+        "length": 32
+      }
+    ],
+    "padding_length": null,
+    "sni_present": true,
+    "alpn": [],
+    "ja3": "771,4865-4866-4867-49199-49195-49200-49196-49191-52393-52392-49161-49171-49162-49172-156-157-47-53,0-23-65281-10-11-35-13-51-45-43,29-23-24,0",
+    "ja3_hash": "71dc8c533dd919ae9f4963224a4ba8fd",
+    "ja4": "t13d181000_5d04281c6031_78e6aca7449b"
+  },
+  "h1": {
+    "headers": [
+      {
+        "name": "Accept",
+        "value": "application/json"
+      },
+      {
+        "name": "Content-Type",
+        "value": "application/json"
+      },
+      {
+        "name": "X-Requested-With",
+        "value": "XMLHttpRequest"
+      },
+      {
+        "name": "x-stainless-arch",
+        "value": "x64"
+      },
+      {
+        "name": "x-stainless-lang",
+        "value": "js"
+      },
+      {
+        "name": "x-stainless-os",
+        "value": "Windows"
+      },
+      {
+        "name": "x-stainless-package-version",
+        "value": "6.25.0"
+      },
+      {
+        "name": "x-stainless-retry-count",
+        "value": "0"
+      },
+      {
+        "name": "x-stainless-runtime",
+        "value": "node"
+      },
+      {
+        "name": "x-stainless-runtime-version",
+        "value": "v22.21.1"
+      },
+      {
+        "name": "X-Conversation-ID",
+        "value": "<redacted>"
+      },
+      {
+        "name": "X-Agent-Purpose",
+        "value": "conversation"
+      },
+      {
+        "name": "X-IDE-Type",
+        "value": "WorkBuddy"
+      },
+      {
+        "name": "X-IDE-Name",
+        "value": "WorkBuddy"
+      },
+      {
+        "name": "X-IDE-Version",
+        "value": "5.9.3"
+      },
+      {
+        "name": "X-Agent-Intent",
+        "value": "craft"
+      },
+      {
+        "name": "X-Agent-Runtime",
+        "value": "<redacted>"
+      },
+      {
+        "name": "X-Private-Data",
+        "value": "<redacted>"
+      },
+      {
+        "name": "acp-connection-id",
+        "value": "<redacted>"
+      },
+      {
+        "name": "x-codebuddy-request",
+        "value": "<redacted>"
+      },
+      {
+        "name": "X-Request-ID",
+        "value": "<redacted>"
+      },
+      {
+        "name": "X-Conversation-Message-ID",
+        "value": "<redacted>"
+      },
+      {
+        "name": "X-Conversation-Request-ID",
+        "value": "<redacted>"
+      },
+      {
+        "name": "X-Root-Request-ID",
+        "value": "<redacted>"
+      },
+      {
+        "name": "X-Agent-Type",
+        "value": "main"
+      },
+      {
+        "name": "baggage",
+        "value": "<redacted>"
+      },
+      {
+        "name": "Content-Encoding",
+        "value": "gzip"
+      },
+      {
+        "name": "traceparent",
+        "value": "<redacted>"
+      },
+      {
+        "name": "b3",
+        "value": "<redacted>"
+      },
+      {
+        "name": "X-B3-TraceId",
+        "value": "<redacted>"
+      },
+      {
+        "name": "X-B3-ParentSpanId",
+        "value": "<redacted>"
+      },
+      {
+        "name": "X-B3-SpanId",
+        "value": "<redacted>"
+      },
+      {
+        "name": "X-B3-Sampled",
+        "value": "<redacted>"
+      },
+      {
+        "name": "X-Trace-ID",
+        "value": "<redacted>"
+      },
+      {
+        "name": "X-Product",
+        "value": "<redacted>"
+      },
+      {
+        "name": "User-Agent",
+        "value": "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"
+      },
+      {
+        "name": "Authorization",
+        "value": "<redacted>"
+      },
+      {
+        "name": "X-User-Id",
+        "value": "<redacted>"
+      },
+      {
+        "name": "Content-Length",
+        "value": "<redacted>"
+      },
+      {
+        "name": "Accept-Encoding",
+        "value": "gzip, compress, deflate, br"
+      },
+      {
+        "name": "Host",
+        "value": "www.workbuddy.cn"
+      },
+      {
+        "name": "Connection",
+        "value": "keep-alive"
+      }
+    ]
+  },
+  "body_pattern": {
+    "encoding": "gzip",
+    "tools_count": 21,
+    "bytes": 23682
+  }
+}

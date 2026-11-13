@@ -14,10 +14,10 @@ use stravia_protocol_codec::transform::{ProtocolTransform, StreamDecodeStage};
 use stravia_runtime_contract::protocol::ids::ProtocolEndpoint;
 use stravia_runtime_contract::protocol::ir::AiRequest;
 use stravia_vendor_common::common;
+use stravia_vendor_sdk::net::{Coding, HttpResponse, Options};
 use stravia_vendor_sdk::{
-    AiErrorKind, AiStreamDelta, ErrorKind, GuestHost, HttpCompression, HttpContentCoding,
-    HttpRequest, HttpResponse, ModelMetadata, OperationOutput, PluginError, ProviderSnapshot,
-    read_http_body,
+    AiErrorKind, AiStreamDelta, ErrorKind, GuestHost, ModelMetadata, OperationOutput, PluginError,
+    ProviderSnapshot, read_http_body,
 };
 
 use crate::{PROTOCOL, Region, auth, request_context::RequestContext};
@@ -59,6 +59,13 @@ pub(crate) fn execute(
     request.stream.enabled = true;
     let mut first_auth_headers = Some(auth::inference_headers(provider, region)?);
     let context = RequestContext::new(host, provider);
+    let gzip = provider
+        .model_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.extensions.get("workbuddy_request_body_gzip"))
+        .and_then(Value::as_bool)
+        != Some(false);
+    let transport_options = chat_options(gzip);
     let mut pair = if enabled {
         provider
             .model_metadata
@@ -69,7 +76,7 @@ pub(crate) fn execute(
         None
     };
     let root = if enabled {
-        Some(crate::state::read(host)?)
+        Some(crate::state::read_paid_windows()?)
     } else {
         None
     };
@@ -149,6 +156,7 @@ pub(crate) fn execute(
         };
         normalize_request_body(&mut body, metadata);
         retain_cli_body(&mut body);
+        apply_cli_request_metadata(&mut body);
         let body = serde_json::to_vec(&body).map_err(|error| {
             common::plugin_error(
                 ErrorKind::Invalid,
@@ -162,18 +170,27 @@ pub(crate) fn execute(
         };
         set_header(&mut headers, "accept", "application/json");
         context.apply(&mut headers);
+        if gzip {
+            headers.push(("Content-Encoding".into(), "gzip".into()));
+        }
         retain_cli_headers(&mut headers);
+        // 长度由宿主在此占位；响应协商头按官方请求顺序紧随其后。
+        headers.push(("Content-Length".into(), String::new()));
+        headers.push((
+            "Accept-Encoding".into(),
+            "gzip, compress, deflate, br".into(),
+        ));
         if attempt == 0 {
             host.emit_started()?;
         }
-        let response = host.http_start_with_compression(
-            HttpRequest {
-                method: "POST".into(),
-                url: format!("{}{CHAT_PATH}", region.origin()),
+        let response = host.http_start(
+            auth::net_request(
+                "POST",
+                format!("{}{CHAT_PATH}", region.origin()),
                 headers,
                 body,
-            },
-            chat_compression(provider.model_metadata.as_ref()),
+            ),
+            &transport_options,
         )?;
         let mut rate_limit = None;
         let mut deferred_deltas = Vec::new();
@@ -213,22 +230,7 @@ pub(crate) fn execute(
             return result;
         };
         if let Some(reset) = reset {
-            // SDK 没有 CAS；请求结束后重新读取，避免用旧快照覆盖认证待登录字段。
-            let mut root = crate::state::read(host)?;
-            let windows = root
-                .entry("workbuddy_paid_windows")
-                .or_insert_with(|| json!({}));
-            let windows = windows
-                .as_object_mut()
-                .filter(|windows| windows.values().all(|reset| reset.as_i64().is_some()))
-                .ok_or_else(|| {
-                    common::plugin_error(
-                        ErrorKind::Invalid,
-                        "stored WorkBuddy paid windows are malformed",
-                    )
-                })?;
-            windows.insert(window_key(provider, region, pair_value), json!(reset));
-            crate::state::write(host, root)?;
+            crate::state::write_paid_window(window_key(provider, region, pair_value), reset)?;
         }
         request = retry_request.expect("only the first free attempt may switch to a paid line");
         paid = true;
@@ -349,74 +351,89 @@ fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
     headers.push((name.to_owned(), value.to_owned()));
 }
 
-/// 压缩属于产品配置快照，不随免费/付费模型切换；编码和传输头由宿主独占。
-fn chat_compression(metadata: Option<&ModelMetadata>) -> HttpCompression {
-    let gzip = metadata
-        .and_then(|metadata| metadata.extensions.get("workbuddy_request_body_gzip"))
-        .and_then(Value::as_bool)
-        != Some(false);
-    HttpCompression {
-        request: gzip.then_some(HttpContentCoding::Gzip),
-        response: Vec::new(),
-    }
+/// 压缩不随免费/付费线路切换；宿主编码正文，插件声明匹配的 Content-Encoding。
+fn chat_options(gzip: bool) -> Options {
+    let mut options = auth::net_options();
+    options
+        .request_encoding(if gzip { Coding::Gzip } else { Coding::Identity })
+        .expect("valid request encoding");
+    // Net 1.1 不支持 compress；若上游选择该编码，宿主会明确拒绝而非返回未解码正文。
+    options
+        .response_decoding(&[Coding::Gzip, Coding::Deflate, Coding::Br])
+        .expect("valid response decoding");
+    options
 }
 
 /// 来自官方 CLI 的默认传输头、身份拦截器、会话与 OTel 注入器。
 /// 不允许自定义透传配置扩大集合；认证值仍由插件自己的区域凭据产生。
 fn retain_cli_headers(headers: &mut Vec<(String, String)>) {
-    const ALLOWED: &[&str] = &[
-        "content-type",
-        "accept",
-        "authorization",
-        "user-agent",
-        "x-stainless-lang",
-        "x-stainless-package-version",
-        "x-stainless-os",
+    // 保留字段顺序，身份字段只在有来源时出现。
+    const ORDER: &[&str] = &[
+        "Accept",
+        "Content-Type",
+        "X-Requested-With",
         "x-stainless-arch",
+        "x-stainless-lang",
+        "x-stainless-os",
+        "x-stainless-package-version",
+        "x-stainless-retry-count",
         "x-stainless-runtime",
         "x-stainless-runtime-version",
-        "x-stainless-retry-count",
-        "x-stainless-timeout",
-        "x-requested-with",
-        "x-agent-purpose",
-        "x-agent-intent",
-        "x-agent-type",
-        "x-private-data",
-        "x-userinfo",
-        "x-ide-name",
-        "x-ide-type",
-        "x-ide-version",
-        "x-product",
-        "x-domain",
-        "x-user-id",
-        "x-enterprise-id",
-        "x-tenant-id",
-        "x-request-id",
-        "x-root-request-id",
-        "x-conversation-id",
-        "x-conversation-message-id",
-        "x-conversation-request-id",
+        "X-Conversation-ID",
+        "X-Agent-Purpose",
+        "X-IDE-Type",
+        "X-IDE-Name",
+        "X-IDE-Version",
+        "X-Agent-Intent",
+        "X-Private-Data",
+        "acp-connection-id",
+        "X-Request-ID",
+        "X-Conversation-Message-ID",
+        "X-Conversation-Request-ID",
+        "X-Root-Request-ID",
+        "X-Agent-Type",
         "baggage",
+        "Content-Encoding",
         "traceparent",
         "tracestate",
-        "x-trace-id",
         "b3",
-        "x-b3-traceid",
-        "x-b3-spanid",
-        "x-b3-parentspanid",
-        "x-b3-sampled",
-        "acp-connection-id",
+        "X-B3-TraceId",
+        "X-B3-ParentSpanId",
+        "X-B3-SpanId",
+        "X-B3-Sampled",
+        "X-Trace-ID",
+        "X-Product",
+        "X-Userinfo",
+        "X-Domain",
+        "X-Enterprise-ID",
+        "X-Tenant-ID",
+        "User-Agent",
+        "Authorization",
+        "X-User-Id",
     ];
-    headers.retain(|(key, _)| {
-        ALLOWED
+    headers.retain_mut(|(name, _)| {
+        let Some(canonical) = ORDER
             .iter()
-            .any(|allowed| key.eq_ignore_ascii_case(allowed))
+            .find(|canonical| name.eq_ignore_ascii_case(canonical))
+        else {
+            return false;
+        };
+        if name != canonical {
+            name.clear();
+            name.push_str(canonical);
+        }
+        true
+    });
+    headers.sort_unstable_by_key(|(name, _)| {
+        ORDER
+            .iter()
+            .position(|canonical| name == canonical)
+            .expect("retained CLI field")
     });
 }
 
-/// 编码后请求体的线规修正，逐项对应上游校验错误码：
-/// developer→system（11128）、首条 system 兜底、tool_choice 归一（11101）、
-/// max_completion_tokens 别名、deepseek 思考模式 reasoning 回填（11155）。
+/// 适配产品网关的消息角色、首条 system、工具选择和推理参数。
+/// 上游错误码可能复用，不能仅凭编号推断具体字段错误。
 /// 不做指纹清洗，不改写用户提示词。
 fn normalize_request_body(body: &mut Value, model_metadata: Option<&ModelMetadata>) {
     normalize_tool_choice(body);
@@ -458,8 +475,42 @@ fn normalize_request_body(body: &mut Value, model_metadata: Option<&ModelMetadat
     }
 }
 
-/// 白名单取自官方 `@tencent-ai/codebuddy-code@2.161.2` 的
-/// OpenAIChatCompletionsModel、消息转换器与产品思考参数构造。
+/// 原版从主 Agent 上下文派生此字段，不信任客户端的 extra_vars。
+/// 此适配器没有原版内部消息标记：末条 user 作为用户回合，tool/assistant
+/// 续接没有可证明的用户发起来源，不补造 initiator。
+fn apply_cli_request_metadata(body: &mut Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    if object
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| messages.last())
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+        == Some("user")
+    {
+        object.insert("extra_vars".into(), json!({"initiator": "user"}));
+    }
+    // 产品网关在显式 effort 下补充摘要；不能仅凭 supportsReasoning
+    // 推断原版的 always-thinking 信号，因而不补造该分支。
+    let has_effort = object.get("reasoning_effort").is_some_and(Value::is_string)
+        || object
+            .get("reasoning")
+            .and_then(|value| value.get("effort"))
+            .is_some_and(Value::is_string);
+    let has_summary = match object.get("reasoning_summary") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+        Some(Value::String(value)) => !value.is_empty(),
+        Some(Value::Number(value)) => value.as_f64().is_none_or(|value| value != 0.0),
+        Some(_) => true,
+    };
+    if has_effort && !has_summary {
+        object.insert("reasoning_summary".into(), json!("auto"));
+    }
+}
+
+/// 白名单取自官方 `@tencent-ai/codebuddy-code@2.161.2` 的聊天转换器与产品参数。
 /// 只筛协议结构；JSON Schema、工具 arguments 和文本是用户数据，不递归清洗。
 fn retain_cli_body(body: &mut Value) {
     retain_fields(
@@ -852,10 +903,12 @@ fn decode_attempt(
     }
 }
 
-fn is_event_stream(headers: &[(String, String)]) -> bool {
-    headers.iter().any(|(name, value)| {
-        name.eq_ignore_ascii_case("content-type")
-            && value.to_ascii_lowercase().contains("text/event-stream")
+fn is_event_stream(headers: &stravia_vendor_sdk::net::Fields) -> bool {
+    headers.iter().any(|field| {
+        field.name.eq_ignore_ascii_case("content-type")
+            && String::from_utf8_lossy(&field.bytes)
+                .to_ascii_lowercase()
+                .contains("text/event-stream")
     })
 }
 
@@ -1458,25 +1511,6 @@ mod tests {
         assert_eq!(
             body["response_format"],
             json!({"type":"json_schema", "json_schema":{"name":"answer", "strict":true, "schema":schema}})
-        );
-    }
-
-    #[test]
-    fn cli_headers_ignore_unknown_names_case_insensitively() {
-        let mut headers = vec![
-            ("AuThOrIzAtIoN".into(), "Bearer local-test".into()),
-            ("X-Requested-With".into(), "XMLHttpRequest".into()),
-            ("X-Client-Only".into(), "ignored".into()),
-            ("oRiGiN".into(), "https://client.invalid".into()),
-            ("X-Product-Version".into(), "ignored".into()),
-        ];
-        retain_cli_headers(&mut headers);
-        assert_eq!(
-            headers,
-            vec![
-                ("AuThOrIzAtIoN".to_owned(), "Bearer local-test".to_owned()),
-                ("X-Requested-With".to_owned(), "XMLHttpRequest".to_owned()),
-            ]
         );
     }
 

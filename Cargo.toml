@@ -1,8 +1,8 @@
 [package]
 name = "stravia-vendor-workbuddy"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
-rust-version = "1.99.0"
+rust-version = "1.99.1"
 license = "MIT"
 authors = ["Chikage0o0 <chikage@939.me>"]
 description = "WorkBuddy China and international vendor component for Stravia"
@@ -12,10 +12,10 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-stravia-vendor-sdk = { git = "https://github.com/Stravia-AI/StraviaPlatform", rev = "83613f4752178e952226fc21a386c3c79a4e3131" }
-stravia-vendor-common = { git = "https://github.com/Stravia-AI/StraviaPlatform", rev = "83613f4752178e952226fc21a386c3c79a4e3131" }
-stravia-runtime-contract = { git = "https://github.com/Stravia-AI/StraviaPlatform", rev = "83613f4752178e952226fc21a386c3c79a4e3131" }
-stravia-protocol-codec = { git = "https://github.com/Stravia-AI/StraviaPlatform", rev = "83613f4752178e952226fc21a386c3c79a4e3131" }
+stravia-vendor-sdk = { git = "https://github.com/Stravia-AI/StraviaPlatform", tag = "v0.7.0" }
+stravia-vendor-common = { git = "https://github.com/Stravia-AI/StraviaPlatform", tag = "v0.7.0" }
+stravia-runtime-contract = { git = "https://github.com/Stravia-AI/StraviaPlatform", tag = "v0.7.0" }
+stravia-protocol-codec = { git = "https://github.com/Stravia-AI/StraviaPlatform", tag = "v0.7.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 semver = { version = "1", features = ["serde"] }
@@ -34,7 +34,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
-stravia-vendor-runtime = { git = "https://github.com/Stravia-AI/StraviaPlatform", rev = "83613f4752178e952226fc21a386c3c79a4e3131" }
+stravia-vendor-runtime = { git = "https://github.com/Stravia-AI/StraviaPlatform", tag = "v0.7.0" }
 async-trait = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 parking_lot = "0.12"

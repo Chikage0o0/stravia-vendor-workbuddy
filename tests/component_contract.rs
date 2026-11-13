@@ -15,14 +15,52 @@ use stravia_protocol_codec::transform::ProtocolTransform;
 use stravia_runtime_contract::{CancellationToken, Deadline};
 use stravia_vendor_common::common;
 use stravia_vendor_runtime::{
-    HostFailure, HostHttpResponse, HostServices, HostWebSocket, HttpRequest, LoadedPlugin,
-    LogLevel, OperationScope, RuntimeError, RuntimeEvent, VendorRuntime, WsRequest,
+    HostFailure, HostHttpResponse, HostServices, HostWebSocket, LoadedPlugin, LogLevel,
+    OperationScope, RuntimeError, RuntimeEvent, VendorRuntime,
+    host::{HostStateCell, StateError, StateScope, StateSnapshot},
 };
 use stravia_vendor_sdk::{
     AllowanceRequest, AuthRequest, AuthResponse, AuthStep, ConnectionCheckRequest,
-    ConnectionCheckVerification, DiscoverRequest, ErrorKind, HttpContentCoding, OperationInput,
-    OperationOutput, ProviderSnapshot,
+    ConnectionCheckVerification, DiscoverRequest, ErrorKind, OperationInput, OperationOutput,
+    ProviderSnapshot,
+    net::{self, ConnectRequest, Field, Options, Request},
 };
+
+struct CapturedRequest {
+    method: String,
+    url: String,
+    headers: Vec<Field>,
+    body: Vec<u8>,
+    options: Options,
+}
+
+struct MemoryCell(Mutex<StateSnapshot>, Mutex<Option<Vec<u8>>>);
+
+#[async_trait]
+impl HostStateCell for MemoryCell {
+    async fn load(&self) -> Result<StateSnapshot, StateError> {
+        Ok(self.0.lock().clone())
+    }
+
+    async fn compare_exchange(
+        &self,
+        expected_revision: u64,
+        payload: Option<Vec<u8>>,
+    ) -> Result<bool, StateError> {
+        let mut state = self.0.lock();
+        if state.revision != expected_revision {
+            return Ok(false);
+        }
+        if let Some(competing_payload) = self.1.lock().take() {
+            state.revision += 1;
+            state.payload = Some(competing_payload);
+            return Ok(false);
+        }
+        state.revision += 1;
+        state.payload = payload;
+        Ok(true)
+    }
+}
 
 struct Reply {
     status: u16,
@@ -52,8 +90,15 @@ impl HostHttpResponse for Reply {
     async fn status(&self) -> Result<u16, HostFailure> {
         Ok(self.status)
     }
-    async fn headers(&self) -> Result<Vec<(String, String)>, HostFailure> {
-        Ok(self.headers.clone())
+    async fn headers(&self) -> Result<Vec<Field>, HostFailure> {
+        Ok(self
+            .headers
+            .iter()
+            .map(|(name, value)| Field {
+                name: name.clone(),
+                bytes: value.as_bytes().to_vec(),
+            })
+            .collect())
     }
     async fn read_body(&self) -> Result<Option<Vec<u8>>, HostFailure> {
         Ok(self.chunks.lock().pop_front())
@@ -62,23 +107,46 @@ impl HostHttpResponse for Reply {
 
 struct LocalUpstream {
     origins: Vec<String>,
+    shapes: Vec<String>,
     replies: Mutex<VecDeque<Reply>>,
-    requests: Mutex<Vec<HttpRequest>>,
+    requests: Mutex<Vec<CapturedRequest>>,
     state: Mutex<Option<Vec<u8>>>,
     state_writes: Mutex<usize>,
+    cells: Mutex<BTreeMap<(u8, String), Arc<MemoryCell>>>,
     events: Mutex<Vec<RuntimeEvent>>,
 }
 
 impl LocalUpstream {
-    fn new(origins: &[&str]) -> Arc<Self> {
+    fn new(origins: &[&str], plugin: Option<&LoadedPlugin>) -> Arc<Self> {
         Arc::new(Self {
             origins: origins.iter().map(|origin| (*origin).into()).collect(),
+            shapes: plugin
+                .into_iter()
+                .flat_map(|plugin| &plugin.descriptor().egress_shapes)
+                .map(|shape| format!("plugin:{}", shape.name))
+                .collect(),
             replies: Mutex::new(VecDeque::new()),
             requests: Mutex::new(Vec::new()),
             state: Mutex::new(None),
             state_writes: Mutex::new(0),
+            cells: Mutex::new(BTreeMap::new()),
             events: Mutex::new(Vec::new()),
         })
+    }
+    fn cell(&self, scope: u8, key: String) -> Arc<MemoryCell> {
+        self.cells
+            .lock()
+            .entry((scope, key))
+            .or_insert_with(|| {
+                Arc::new(MemoryCell(
+                    Mutex::new(StateSnapshot {
+                        revision: 0,
+                        payload: None,
+                    }),
+                    Mutex::new(None),
+                ))
+            })
+            .clone()
     }
     fn reply(&self, value: Reply) {
         self.replies.lock().push_back(value);
@@ -95,7 +163,32 @@ impl LocalUpstream {
 
 #[async_trait]
 impl HostServices for LocalUpstream {
-    fn http_start(&self, request: HttpRequest) -> Result<Arc<dyn HostHttpResponse>, HostFailure> {
+    fn validate_net_option(&self, key: &str, value: &str) -> Result<(), net::OptionError> {
+        net::validate_host_option(key, value)?;
+        if key == net::keys::SHAPE
+            && value != "default"
+            && !self.shapes.iter().any(|shape| shape == value)
+        {
+            return Err(net::OptionError {
+                key: key.into(),
+                value: value.into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn http_start(
+        &self,
+        request: Request,
+        options: Options,
+    ) -> Result<Arc<dyn HostHttpResponse>, HostFailure> {
+        let request = CapturedRequest {
+            method: request.method,
+            url: request.url,
+            headers: request.headers.into_vec(),
+            body: request.body,
+            options,
+        };
         let url = url::Url::parse(&request.url)
             .map_err(|_| HostFailure::new(ErrorKind::Invalid, "invalid HTTP destination"))?;
         if !self.origins.contains(&url.origin().ascii_serialization()) {
@@ -107,11 +200,11 @@ impl HostServices for LocalUpstream {
         if url.path() == "/v2/chat/completions" {
             let _ = application_request_body(&request);
         } else {
-            assert!(
-                request.compression.is_none(),
-                "authentication, configuration, and allowance calls must retain legacy HTTP policy"
+            assert_eq!(
+                request.options.iter().collect::<Vec<_>>(),
+                vec![(net::keys::SHAPE, "plugin:workbuddy")],
+                "authentication, configuration, and allowance calls use the WorkBuddy HTTP shape"
             );
-            assert_no_compression_headers(&request);
         }
         self.requests.lock().push(request);
         Ok(Arc::new(
@@ -121,7 +214,11 @@ impl HostServices for LocalUpstream {
                 .expect("unexpected HTTP request or retry"),
         ))
     }
-    async fn ws_connect(&self, _: WsRequest) -> Result<Arc<dyn HostWebSocket>, HostFailure> {
+    async fn ws_connect(
+        &self,
+        _: ConnectRequest,
+        _: Options,
+    ) -> Result<Arc<dyn HostWebSocket>, HostFailure> {
         Err(HostFailure::new(
             ErrorKind::Unsupported,
             "WebSocket is not allowed in this contract",
@@ -135,6 +232,20 @@ impl HostServices for LocalUpstream {
         *self.state.lock() = Some(bytes);
         Ok(())
     }
+    async fn open_state(
+        &self,
+        scope: StateScope,
+        key: String,
+    ) -> Result<Arc<dyn HostStateCell>, StateError> {
+        let scope = match scope {
+            StateScope::Provider => 0,
+            StateScope::Conversation => 1,
+        };
+        Ok(self.cell(scope, key))
+    }
+    async fn open_volatile_state(&self, key: String) -> Result<Arc<dyn HostStateCell>, StateError> {
+        Ok(self.cell(2, key))
+    }
     async fn emit_event(&self, event: RuntimeEvent) -> Result<(), HostFailure> {
         self.events.lock().push(event);
         Ok(())
@@ -143,6 +254,59 @@ impl HostServices for LocalUpstream {
     fn generation_is_current(&self, generation: u64) -> bool {
         generation == 1
     }
+}
+
+#[tokio::test]
+async fn in_memory_state_cells_enforce_revisions_and_scope() {
+    let local = LocalUpstream::new(&[], None);
+    let cell = local
+        .open_state(StateScope::Provider, "window".into())
+        .await
+        .unwrap();
+    let other = local
+        .open_state(StateScope::Conversation, "window".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        cell.load().await.unwrap(),
+        StateSnapshot {
+            revision: 0,
+            payload: None
+        }
+    );
+    assert!(
+        cell.compare_exchange(0, Some(b"first".to_vec()))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !cell
+            .compare_exchange(0, Some(b"stale".to_vec()))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        cell.load().await.unwrap(),
+        StateSnapshot {
+            revision: 1,
+            payload: Some(b"first".to_vec())
+        }
+    );
+    assert_eq!(
+        other.load().await.unwrap(),
+        StateSnapshot {
+            revision: 0,
+            payload: None
+        }
+    );
+    assert!(cell.compare_exchange(1, None).await.unwrap());
+    assert_eq!(
+        cell.load().await.unwrap(),
+        StateSnapshot {
+            revision: 2,
+            payload: None
+        }
+    );
 }
 
 async fn run(
@@ -202,18 +366,19 @@ fn response_wire(output: OperationOutput) -> Value {
         .unwrap()
 }
 
-fn request_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {
+fn request_header<'a>(request: &'a CapturedRequest, name: &str) -> Option<&'a str> {
     request
         .headers
         .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_str())
+        .find(|field| field.name.eq_ignore_ascii_case(name))
+        .map(|field| std::str::from_utf8(&field.bytes).expect("expected textual request header"))
 }
 
-fn assert_no_chat_identity_headers(request: &HttpRequest) {
+fn assert_no_chat_identity_headers(request: &CapturedRequest) {
     assert!(
-        request.headers.iter().all(|(name, _)| {
-            !name
+        request.headers.iter().all(|field| {
+            !field
+                .name
                 .get(.."x-stainless-".len())
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-stainless-"))
         }),
@@ -233,80 +398,107 @@ fn assert_no_chat_identity_headers(request: &HttpRequest) {
     }
 }
 
-fn assert_no_compression_headers(request: &HttpRequest) {
-    for name in ["accept-encoding", "content-encoding", "content-length"] {
-        assert!(
-            request_header(request, name).is_none(),
-            "{name} must be owned by the host, not the guest"
-        );
-    }
-}
-
-fn application_request_body(request: &HttpRequest) -> Value {
-    assert_no_compression_headers(request);
-    let compression = request
-        .compression
-        .as_ref()
-        .expect("chat must explicitly opt into host-owned compression, even for identity");
+fn application_request_body(request: &CapturedRequest) -> Value {
+    let options: BTreeMap<_, _> = request.options.iter().collect();
+    assert_eq!(
+        request_header(request, "content-encoding"),
+        if options.get(net::keys::REQUEST_ENCODING) == Some(&"gzip") {
+            Some("gzip")
+        } else {
+            None
+        },
+        "Net 1.x requires the declared encoding to match the guest-owned field"
+    );
+    assert_eq!(options.get(net::keys::SHAPE), Some(&"plugin:workbuddy"));
+    assert_eq!(
+        request_header(request, "accept-encoding"),
+        Some("gzip, compress, deflate, br")
+    );
+    assert_eq!(
+        options.get(net::keys::RESPONSE_DECODING),
+        Some(&"gzip,deflate,br"),
+        "the host decodes the supported advertised response codings"
+    );
+    let content_length = request
+        .headers
+        .iter()
+        .position(|field| field.name == "Content-Length")
+        .unwrap();
+    let accept_encoding = request
+        .headers
+        .iter()
+        .position(|field| field.name == "Accept-Encoding")
+        .unwrap();
+    let host = request
+        .headers
+        .iter()
+        .position(|field| field.name == "Host")
+        .unwrap();
+    assert!(content_length < accept_encoding && accept_encoding < host);
     assert!(
-        compression.response.is_empty(),
-        "chat responses must retain identity-only negotiation"
+        options.contains_key(net::keys::REQUEST_ENCODING),
+        "chat must explicitly opt into host-owned request encoding"
     );
     serde_json::from_slice(&request.body)
         .expect("the host must receive original application JSON bytes, not precompressed bytes")
 }
 
-fn assert_chat_compression(request: &HttpRequest, gzip: bool) {
+fn assert_chat_compression(request: &CapturedRequest, gzip: bool) {
     let _ = application_request_body(request);
-    let coding = &request.compression.as_ref().unwrap().request;
-    if gzip {
-        assert!(matches!(coding, Some(HttpContentCoding::Gzip)));
-    } else {
-        assert!(
-            coding.is_none(),
-            "the official gzip switch must disable request coding"
-        );
-    }
+    let coding = request
+        .options
+        .iter()
+        .find(|(key, _)| *key == net::keys::REQUEST_ENCODING)
+        .map(|(_, value)| value);
+    assert_eq!(
+        coding,
+        Some(if gzip { "gzip" } else { "identity" }),
+        "request encoding must follow the official gzip switch"
+    );
 }
 
 fn whitelist_request() -> stravia_vendor_sdk::AiRequest {
     let endpoint = common::endpoint("openai-compatible").unwrap();
+    let mut wire = json!({
+        "model":"client-route-name", "stream":true,
+        "temperature":0.25,"top_p":0.8,"max_tokens":123,"reasoning_effort":"high",
+        "store":true,"prompt_cache_retention":"24h","prompt_cache_key":"client-only-cache-key",
+        "logit_bias":{"1":1},"logprobs":true,"top_logprobs":2,"n":2,"seed":7,
+        "user":"client-user","metadata":{"client":"only"},"service_tier":"auto",
+        "stream_options":{"include_usage":true,"include_obfuscation":true},
+        "response_format":{"type":"json_schema","json_schema":{
+            "name":"weather_result","schema":{
+                "type":"object","properties":{"x_client_only":{"type":"string","default":"杭州"}},
+                "default":{"x_client_only":"杭州"},"x_schema_extension":{"x_structure_only":true}
+            }
+        }},
+        "x_client_only":{"secret":"never-forward"},
+        "thinking":{"type":"enabled","x_structure_only":true},
+        "messages":[
+            {"role":"user","content":"保留 x_client_only 和 x_structure_only 原文","agent":"craft","conversationRequestId":"turn-fixture","x_structure_only":true},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_weather","type":"function","x_structure_only":true,
+                 "function":{"name":"weather","arguments":"{\"x_client_only\":{\"city\":\"杭州\"}}","x_structure_only":true}}
+            ]},
+            {"role":"tool","tool_call_id":"call_weather","content":"{\"x_client_only\":\"tool result\"}","x_structure_only":true}
+        ],
+        "tools":[{"type":"function","x_structure_only":true,"function":{
+            "name":"weather","description":"保留 x_structure_only 描述","x_structure_only":true,
+            "parameters":{
+                "type":"object",
+                "properties":{"x_client_only":{"type":"object","default":{"x_structure_only":"杭州"}}},
+                "default":{"x_client_only":{"x_structure_only":"杭州"}},
+                "x_schema_extension":{"x_structure_only":true}
+            }
+        }}]
+    });
+    wire["extra_vars"] = json!({"client_key":"client_value"});
+    wire["cache_retention"] = json!("short");
+    wire["prompt_cache_options"] = json!({"type":"ephemeral"});
     let mut request = ProtocolTransform::global()
         .bind(endpoint, endpoint)
         .unwrap()
-        .decode_request(json!({
-            "model":"client-route-name", "stream":true,
-            "temperature":0.25,"top_p":0.8,"max_tokens":123,"reasoning_effort":"high",
-            "store":true,"prompt_cache_retention":"24h","prompt_cache_key":"client-only-cache-key",
-            "logit_bias":{"1":1},"logprobs":true,"top_logprobs":2,"n":2,"seed":7,
-            "user":"client-user","metadata":{"client":"only"},"service_tier":"auto",
-            "stream_options":{"include_usage":true,"include_obfuscation":true},
-            "response_format":{"type":"json_schema","json_schema":{
-                "name":"weather_result","schema":{
-                    "type":"object","properties":{"x_client_only":{"type":"string","default":"杭州"}},
-                    "default":{"x_client_only":"杭州"},"x_schema_extension":{"x_structure_only":true}
-                }
-            }},
-            "x_client_only":{"secret":"never-forward"},
-            "thinking":{"type":"enabled","x_structure_only":true},
-            "messages":[
-                {"role":"user","content":"保留 x_client_only 和 x_structure_only 原文","x_structure_only":true},
-                {"role":"assistant","content":null,"tool_calls":[
-                    {"id":"call_weather","type":"function","x_structure_only":true,
-                     "function":{"name":"weather","arguments":"{\"x_client_only\":{\"city\":\"杭州\"}}","x_structure_only":true}}
-                ]},
-                {"role":"tool","tool_call_id":"call_weather","content":"{\"x_client_only\":\"tool result\"}","x_structure_only":true}
-            ],
-            "tools":[{"type":"function","x_structure_only":true,"function":{
-                "name":"weather","description":"保留 x_structure_only 描述","x_structure_only":true,
-                "parameters":{
-                    "type":"object",
-                    "properties":{"x_client_only":{"type":"object","default":{"x_structure_only":"杭州"}}},
-                    "default":{"x_client_only":{"x_structure_only":"杭州"}},
-                    "x_schema_extension":{"x_structure_only":true}
-                }
-            }}]
-        }))
+        .decode_request(wire)
         .unwrap();
     // 宿主路由后的目标控制必须覆盖入口 high；统一参数不能绕过此优先级。
     request.reasoning.target_control = Some(
@@ -341,6 +533,87 @@ fn request_with_unknown() -> stravia_vendor_sdk::AiRequest {
 
 #[tokio::test]
 #[ignore = "build the release wasm32-wasip2 component first"]
+async fn chat_initiator_tracks_user_turn_without_trusting_client_metadata() {
+    let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/wasm32-wasip2/release/stravia_vendor_workbuddy.wasm");
+    let runtime = VendorRuntime::new().unwrap();
+    let plugin = runtime
+        .load(&std::fs::read(artifact).unwrap())
+        .await
+        .unwrap();
+    let domain = "www.workbuddy.ai";
+    let origin = format!("https://{domain}");
+    let local = LocalUpstream::new(&[&origin], Some(&plugin));
+    let mut provider = snapshot("intl", &origin);
+    provider.model = Some("synthetic-model".into());
+    provider.credentials = BTreeMap::from([
+        ("region".into(), json!("intl")),
+        ("domain".into(), json!(domain)),
+        ("uid".into(), json!("synthetic-account")),
+        (
+            "access_token".into(),
+            json!(token(domain, "synthetic-account", 1)),
+        ),
+    ]);
+    let endpoint = common::endpoint("openai-compatible").unwrap();
+    let transform = ProtocolTransform::global()
+        .bind(endpoint, endpoint)
+        .unwrap();
+    for (messages, expected_initiator) in [
+        (
+            json!([
+                {"role":"system","content":"synthetic system"},
+                {"role":"user","content":"Reply with a short greeting."}
+            ]),
+            Some("user"),
+        ),
+        (
+            json!([
+                {"role":"system","content":"synthetic system"},
+                {"role":"user","content":"Use the tool."},
+                {"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"call_1","content":"synthetic result"}
+            ]),
+            None,
+        ),
+    ] {
+        let input = transform
+            .decode_request(json!({
+                "model":"client-model", "stream":true, "reasoning_effort":"high",
+                "stream_options":{"include_usage":true},
+                "messages":messages,
+                "extra_vars":{"initiator":"attacker", "client_key":"must-not-forward"}
+            }))
+            .unwrap();
+        local.reply(Reply::stream(&completion_stream(
+            "synthetic-model",
+            "synthetic answer",
+        )));
+        run(
+            &runtime,
+            &plugin,
+            "intl",
+            OperationInput::Infer {
+                provider: provider.clone(),
+                request: input,
+            },
+            local.scope(),
+        )
+        .await
+        .unwrap();
+        let requests = local.requests.lock();
+        let chat = requests.last().unwrap();
+        let body = application_request_body(chat);
+        assert_eq!(body["reasoning_summary"], "auto");
+        match expected_initiator {
+            Some(initiator) => assert_eq!(body["extra_vars"], json!({"initiator":initiator})),
+            None => assert!(body.get("extra_vars").is_none()),
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "build the release wasm32-wasip2 component first"]
 async fn inference_whitelist_preserves_user_payload_contract() {
     let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("target/wasm32-wasip2/release/stravia_vendor_workbuddy.wasm");
@@ -351,7 +624,7 @@ async fn inference_whitelist_preserves_user_payload_contract() {
         .unwrap();
     for (region, domain) in [("cn", "www.workbuddy.cn"), ("intl", "www.workbuddy.ai")] {
         let origin = format!("https://{domain}");
-        let local = LocalUpstream::new(&[&origin]);
+        let local = LocalUpstream::new(&[&origin], Some(&plugin));
         let mut provider = snapshot(region, &origin);
         let access_token = token(domain, "whitelist-account", 1);
         provider.credentials = BTreeMap::from([
@@ -423,6 +696,9 @@ async fn inference_whitelist_preserves_user_payload_contract() {
         assert_eq!(body["reasoning_effort"], "medium");
         assert_eq!(body["store"], true);
         assert_eq!(body["prompt_cache_retention"], "24h");
+        for key in ["extra_vars", "cache_retention", "prompt_cache_options"] {
+            assert!(body.get(key).is_none());
+        }
         assert_eq!(body["stream_options"]["include_usage"], true);
         assert!(body["stream_options"].get("include_obfuscation").is_none());
         assert_eq!(
@@ -459,6 +735,8 @@ async fn inference_whitelist_preserves_user_payload_contract() {
             .iter()
             .find(|message| message["role"] == "assistant")
             .unwrap();
+        assert!(user.get("agent").is_none());
+        assert!(user.get("conversationRequestId").is_none());
         assert_eq!(
             user["content"],
             "保留 x_client_only 和 x_structure_only 原文"
@@ -498,35 +776,73 @@ async fn inference_whitelist_preserves_user_payload_contract() {
             !chat
                 .headers
                 .iter()
-                .any(|(key, _)| key.eq_ignore_ascii_case("x-client-only"))
+                .any(|field| field.name.eq_ignore_ascii_case("x-client-only"))
         );
         assert!(
             !chat
                 .headers
                 .iter()
-                .any(|(_, value)| value == "client-auth-must-not-win")
+                .any(|field| field.bytes == b"client-auth-must-not-win")
         );
         assert!(
             chat.headers
                 .iter()
-                .any(|(key, value)| key.eq_ignore_ascii_case("x-domain") && value == domain)
+                .any(|field| field.name.eq_ignore_ascii_case("x-domain")
+                    && field.bytes == domain.as_bytes())
         );
-        let ide_version = &chat
+        let version = if region == "cn" { "5.9.3" } else { "5.9.4" };
+        assert_eq!(request_header(chat, "x-ide-version"), Some(version));
+        assert_eq!(request_header(chat, "accept"), Some("application/json"));
+        assert_eq!(request_header(chat, "x-ide-type"), Some("WorkBuddy"));
+        assert_eq!(request_header(chat, "x-ide-name"), Some("WorkBuddy"));
+        let user_agent = request_header(chat, "user-agent").unwrap();
+        assert!(user_agent.starts_with(&format!("WorkBuddy/{version} ")));
+        if region == "cn" {
+            assert_eq!(user_agent, "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0");
+        } else {
+            assert_eq!(user_agent, "WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0");
+        }
+        let expected = [
+            "Accept",
+            "Content-Type",
+            "X-Requested-With",
+            "x-stainless-arch",
+            "x-stainless-lang",
+            "x-stainless-os",
+            "x-stainless-package-version",
+            "x-stainless-retry-count",
+            "x-stainless-runtime",
+            "x-stainless-runtime-version",
+            "X-Agent-Purpose",
+            "X-IDE-Type",
+            "X-IDE-Name",
+            "X-IDE-Version",
+            "X-Agent-Intent",
+            "X-Private-Data",
+            "X-Request-ID",
+            "X-Conversation-Message-ID",
+            "X-Conversation-Request-ID",
+            "X-Root-Request-ID",
+            "X-Agent-Type",
+            "Content-Encoding",
+            "traceparent",
+            "b3",
+            "X-B3-TraceId",
+            "X-B3-SpanId",
+            "X-B3-Sampled",
+            "X-Trace-ID",
+            "X-Product",
+            "User-Agent",
+            "Authorization",
+            "X-User-Id",
+        ];
+        let observed: Vec<&str> = chat
             .headers
             .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case("x-ide-version"))
-            .expect("product version header")
-            .1;
-        let user_agent = &chat
-            .headers
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case("user-agent"))
-            .expect("product user agent")
-            .1;
-        assert!(user_agent.starts_with(&format!("WorkBuddy/{ide_version} ")));
-        let (_, embedded_identity) = user_agent.split_once(' ').unwrap();
-        let (embedded_product, _) = embedded_identity.rsplit_once(" CLI/").unwrap();
-        assert!(embedded_product.ends_with(&format!("/{ide_version}")));
+            .map(|field| field.name.as_str())
+            .filter(|name| expected.contains(name))
+            .collect();
+        assert_eq!(observed, expected);
         for forbidden in [
             "x-model-id",
             "x-product-version",
@@ -539,22 +855,15 @@ async fn inference_whitelist_preserves_user_payload_contract() {
                 !chat
                     .headers
                     .iter()
-                    .any(|(key, _)| key.eq_ignore_ascii_case(forbidden)),
+                    .any(|field| field.name.eq_ignore_ascii_case(forbidden)),
                 "{forbidden} must not be forwarded"
             );
         }
         assert!(
-            chat.headers
-                .iter()
-                .any(|(key, value)| key.eq_ignore_ascii_case("authorization")
-                    && value.contains(&access_token))
+            request_header(chat, "authorization")
+                .is_some_and(|value| value.contains(&access_token))
         );
-        assert!(
-            chat.headers
-                .iter()
-                .any(|(key, value)| key.eq_ignore_ascii_case("x-user-id")
-                    && value == "whitelist-account")
-        );
+        assert_eq!(request_header(chat, "x-user-id"), Some("whitelist-account"));
     }
 }
 
@@ -588,7 +897,7 @@ async fn regional_auth_streaming_and_failure_contract() {
 
     for (region, domain) in [("cn", "www.workbuddy.cn"), ("intl", "www.workbuddy.ai")] {
         let origin = format!("https://{domain}");
-        let local = LocalUpstream::new(&[&origin]);
+        let local = LocalUpstream::new(&[&origin], Some(&plugin));
         let mut provider = snapshot(region, &origin);
         local.reply(Reply::json(json!({"code":0,"data":{"state":"local-state","authUrl":format!("{origin}/login?state=local-state")}})));
         let start = run(
@@ -615,14 +924,16 @@ async fn regional_auth_streaming_and_failure_contract() {
         {
             let requests = local.requests.lock();
             let start = requests.last().unwrap();
-            let platform = if region == "cn" {
-                "workbuddy"
-            } else {
-                "workbuddy-ai"
-            };
             assert_eq!(
                 start.url,
-                format!("{origin}/v2/plugin/auth/state?platform={platform}")
+                format!(
+                    "{origin}/v2/plugin/auth/state?platform={}",
+                    if region == "cn" {
+                        "workbuddy"
+                    } else {
+                        "workbuddy-ai"
+                    }
+                )
             );
         }
 
@@ -663,6 +974,10 @@ async fn regional_auth_streaming_and_failure_contract() {
         let OperationOutput::Auth(AuthResponse::Credentials { values, .. }) = login else {
             panic!("expected stored credentials")
         };
+        assert!(!values.contains_key("workbuddy_brand"));
+        assert!(!values.contains_key("workbuddy_version"));
+        assert!(!values.contains_key("codebuddy_brand"));
+        assert!(!values.contains_key("codebuddy_version"));
         provider.credentials = values;
 
         local.reply(Reply::json(json!({"code":0,"data":{"data":{"accessToken":token(domain,"account-a",2),"refreshToken":"refresh-two","domain":domain}}})));
@@ -692,9 +1007,10 @@ async fn regional_auth_streaming_and_failure_contract() {
                 refresh.url,
                 format!("{origin}/v2/plugin/auth/token/refresh")
             );
-            assert!(refresh.headers.iter().any(|(key, value)| {
-                key.eq_ignore_ascii_case("x-auth-refresh-source") && value == "plugin"
-            }));
+            assert_eq!(
+                request_header(refresh, "x-auth-refresh-source"),
+                Some("plugin")
+            );
         }
 
         local.reply(Reply::json(json!({"code":0,"data":{"endpoint":"https://untrusted.invalid","models":[{"id":"test-model","name":"Test","supportsToolCall":true,"credits":"x0.10"}],"agents":[{"name":"cli","tags":["default"],"models":["test-model"]}]}})));
@@ -769,7 +1085,8 @@ async fn regional_auth_streaming_and_failure_contract() {
             assert!(
                 chat.headers
                     .iter()
-                    .any(|(key, value)| key.eq_ignore_ascii_case("x-domain") && value == domain)
+                    .any(|field| field.name.eq_ignore_ascii_case("x-domain")
+                        && field.bytes == domain.as_bytes())
             );
         }
         assert_eq!(
@@ -808,6 +1125,7 @@ async fn regional_auth_streaming_and_failure_contract() {
         );
         for invalid_base in [
             "https://copilot.tencent.com",
+            "https://www.codebuddy.ai",
             "https://www.codebuddy.cn",
             if region == "cn" {
                 "https://www.workbuddy.ai"
@@ -905,7 +1223,7 @@ async fn regional_allowance_contract() {
         .unwrap();
     for (region, domain) in [("cn", "www.workbuddy.cn"), ("intl", "www.workbuddy.ai")] {
         let origin = format!("https://{domain}");
-        let local = LocalUpstream::new(&[&origin]);
+        let local = LocalUpstream::new(&[&origin], Some(&plugin));
         let mut provider = snapshot(region, &origin);
         provider.credentials = BTreeMap::from([
             ("region".into(), json!(region)),
@@ -994,13 +1312,14 @@ async fn regional_allowance_contract() {
                 request
                     .headers
                     .iter()
-                    .any(|(key, value)| key.eq_ignore_ascii_case("x-domain") && value == domain)
+                    .any(|field| field.name.eq_ignore_ascii_case("x-domain")
+                        && field.bytes == domain.as_bytes())
             );
             assert!(
                 !request
                     .headers
                     .iter()
-                    .any(|(key, _)| key.eq_ignore_ascii_case("x-ide-type"))
+                    .any(|field| field.name.eq_ignore_ascii_case("x-ide-type"))
             );
             let profile = &requests[1];
             assert_eq!(profile.method, "GET");
@@ -1023,6 +1342,27 @@ async fn regional_allowance_contract() {
                 Some("quota-tenant")
             );
         }
+
+        local.reply(Reply::json(json!({"code":0,"data":{
+            "TotalCredits":"25.5",
+            "Packages":[{"CycleTotalCapacity":100,"CycleRemainCapacity":20,"CycleUsedCapacity":80}]
+        }})));
+        local.reply(account_response(
+            json!({"uid":"quota-account","enterpriseId":"quota-tenant"}),
+        ));
+        let output = run(&runtime, &plugin, region, input(), local.scope())
+            .await
+            .unwrap();
+        let OperationOutput::Allowance(result) = output else {
+            panic!("expected allowance result")
+        };
+        assert_eq!(
+            result.allowances[0].remaining.as_ref().unwrap().value,
+            "25.5"
+        );
+        assert!(result.allowances[0].used.is_none());
+        assert!(result.allowances[0].limit.is_none());
+        assert!(result.allowances[0].used_percent.is_none());
 
         for (account, expected) in [
             (
@@ -1188,7 +1528,7 @@ async fn connection_checks_require_matching_account_evidence_without_side_effect
         .unwrap();
     for (region, domain) in [("cn", "www.workbuddy.cn"), ("intl", "www.workbuddy.ai")] {
         let origin = format!("https://{domain}");
-        let local = LocalUpstream::new(&[&origin]);
+        let local = LocalUpstream::new(&[&origin], Some(&plugin));
         let state = b"existing-auth-and-paid-window".to_vec();
         *local.state.lock() = Some(state.clone());
         let mut provider = snapshot(region, &origin);
@@ -1365,7 +1705,7 @@ async fn default_agent_models_merge_free_and_paid_lines() {
         .load(&std::fs::read(artifact).unwrap())
         .await
         .unwrap();
-    let local = LocalUpstream::new(&["https://www.workbuddy.cn"]);
+    let local = LocalUpstream::new(&["https://www.workbuddy.cn"], Some(&plugin));
     let mut provider = snapshot("cn", "https://www.workbuddy.cn");
     provider.credentials = BTreeMap::from([
         ("region".into(), json!("cn")),
@@ -1529,7 +1869,7 @@ async fn regional_chat_identity_isolation_and_client_header_injection_contract()
         .unwrap();
     for (region, domain) in [("cn", "www.workbuddy.cn"), ("intl", "www.workbuddy.ai")] {
         let origin = format!("https://{domain}");
-        let local = LocalUpstream::new(&[&origin]);
+        let local = LocalUpstream::new(&[&origin], Some(&plugin));
         let mut provider = snapshot(region, &origin);
         let tenant = format!("tenant-{region}");
         provider.credentials = BTreeMap::from([
@@ -1553,6 +1893,7 @@ async fn regional_chat_identity_isolation_and_client_header_injection_contract()
             "x-stainless-client-only",
             "x-stainless-helper-method",
             "x-stainless-poll-helper",
+            "x-stainless-timeout",
         ];
         let sdk_headers = [
             "x-stainless-lang",
@@ -1562,7 +1903,6 @@ async fn regional_chat_identity_isolation_and_client_header_injection_contract()
             "x-stainless-runtime",
             "x-stainless-runtime-version",
             "x-stainless-retry-count",
-            "x-stainless-timeout",
         ];
         provider.client_headers = source_only_headers
             .iter()
@@ -1607,8 +1947,26 @@ async fn regional_chat_identity_isolation_and_client_header_injection_contract()
             let requests = local.requests.lock();
             let wire = requests.last().unwrap();
             assert_eq!(request_header(wire, "x-private-data"), Some("false"));
+            assert_eq!(request_header(wire, "x-agent-runtime"), None);
+            assert_eq!(request_header(wire, "x-agent-type"), Some("main"));
+            assert_eq!(request_header(wire, "x-agent-intent"), Some("craft"));
+            assert_eq!(
+                request_header(wire, "x-agent-purpose"),
+                Some("conversation")
+            );
+            assert_eq!(request_header(wire, "x-stainless-retry-count"), Some("0"));
+            assert_eq!(request_header(wire, "x-stainless-timeout"), None);
             assert_eq!(request_header(wire, "x-stainless-os"), Some("Windows"));
             assert_eq!(request_header(wire, "x-stainless-arch"), Some("x64"));
+            assert_eq!(
+                request_header(wire, "x-stainless-package-version"),
+                Some("6.25.0")
+            );
+            assert_eq!(request_header(wire, "x-stainless-runtime"), Some("node"));
+            assert_eq!(
+                request_header(wire, "x-stainless-runtime-version"),
+                Some("v22.21.1")
+            );
             for name in sdk_headers {
                 assert_ne!(
                     request_header(wire, name),
@@ -1618,7 +1976,7 @@ async fn regional_chat_identity_isolation_and_client_header_injection_contract()
                 assert_eq!(
                     wire.headers
                         .iter()
-                        .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                        .filter(|field| field.name.eq_ignore_ascii_case(name))
                         .count(),
                     1,
                     "a spoofed SDK header must not coexist with the fixed profile"
@@ -1657,7 +2015,7 @@ async fn regional_chat_identity_isolation_and_client_header_injection_contract()
                 assert_eq!(
                     wire.headers
                         .iter()
-                        .filter(|(name, _)| name.eq_ignore_ascii_case("x-userinfo"))
+                        .filter(|field| field.name.eq_ignore_ascii_case("x-userinfo"))
                         .count(),
                     1,
                     "a spoofed identity must not survive alongside the real identity"
@@ -1751,7 +2109,7 @@ async fn request_context_survives_retry_and_separates_model_calls() {
     let component = std::fs::read(artifact).unwrap();
     let runtime = VendorRuntime::new().unwrap();
     let plugin = runtime.load(&component).await.unwrap();
-    let local = LocalUpstream::new(&["https://www.workbuddy.cn"]);
+    let local = LocalUpstream::new(&["https://www.workbuddy.cn"], Some(&plugin));
     let mut provider = paid_provider();
     provider
         .options
@@ -2051,7 +2409,10 @@ async fn automatic_paid_line_switch_and_window_contract() {
         "json-nested-future",
         "http-future-window",
     ] {
-        let local = LocalUpstream::new(&["https://www.workbuddy.cn", "https://www.workbuddy.ai"]);
+        let local = LocalUpstream::new(
+            &["https://www.workbuddy.cn", "https://www.workbuddy.ai"],
+            Some(&plugin),
+        );
         let mut provider = paid_provider();
         provider
             .options
@@ -2268,8 +2629,10 @@ async fn automatic_paid_line_switch_and_window_contract() {
 
             // 用已到期的持久化时间模拟窗口结束，避免依赖等待和调度时序。
             {
-                let mut stored = local.state.lock();
-                let mut root: Value = serde_json::from_slice(stored.as_deref().unwrap()).unwrap();
+                let cell = local.cell(0, "workbuddy_paid_windows".into());
+                let mut stored = cell.0.lock();
+                let mut root: Value =
+                    serde_json::from_slice(stored.payload.as_deref().unwrap()).unwrap();
                 for reset in root["workbuddy_paid_windows"]
                     .as_object_mut()
                     .unwrap()
@@ -2277,7 +2640,8 @@ async fn automatic_paid_line_switch_and_window_contract() {
                 {
                     *reset = json!(1);
                 }
-                *stored = Some(serde_json::to_vec(&root).unwrap());
+                stored.payload = Some(serde_json::to_vec(&root).unwrap());
+                stored.revision += 1;
             }
             local.reply(Reply::stream(&completion_stream(
                 "hy3",
@@ -2328,7 +2692,7 @@ async fn automatic_paid_line_rejects_unsafe_retries() {
         "paid-fails",
         "invalid-option",
     ] {
-        let local = LocalUpstream::new(&["https://www.workbuddy.cn"]);
+        let local = LocalUpstream::new(&["https://www.workbuddy.cn"], Some(&plugin));
         let mut provider = paid_provider();
         if scenario != "default-off" {
             provider
@@ -2410,7 +2774,7 @@ async fn configured_model_resolves_paid_line_after_cap() {
         .load(&std::fs::read(artifact).unwrap())
         .await
         .unwrap();
-    let local = LocalUpstream::new(&["https://www.workbuddy.cn"]);
+    let local = LocalUpstream::new(&["https://www.workbuddy.cn"], Some(&plugin));
     let mut provider = paid_provider();
     provider.model_metadata = None;
     provider.options.insert("model_ids".into(), json!("hy3"));
@@ -2479,7 +2843,7 @@ async fn configured_model_resolves_paid_line_after_cap() {
 
 #[tokio::test]
 #[ignore = "build the release wasm32-wasip2 component first"]
-async fn paid_window_survives_login_and_revoke_clears_it() {
+async fn paid_window_survives_login_and_revoke() {
     let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("target/wasm32-wasip2/release/stravia_vendor_workbuddy.wasm");
     let runtime = VendorRuntime::new().unwrap();
@@ -2487,7 +2851,7 @@ async fn paid_window_survives_login_and_revoke_clears_it() {
         .load(&std::fs::read(artifact).unwrap())
         .await
         .unwrap();
-    let local = LocalUpstream::new(&["https://www.workbuddy.cn"]);
+    let local = LocalUpstream::new(&["https://www.workbuddy.cn"], Some(&plugin));
     let mut provider = paid_provider();
     provider
         .options
@@ -2640,8 +3004,8 @@ async fn paid_window_survives_login_and_revoke_clears_it() {
         OperationOutput::Auth(AuthResponse::Revoked)
     ));
     local.reply(Reply::stream(&completion_stream(
-        "hy3",
-        "free after revoke",
+        "hy3-x",
+        "paid after revoke",
     )));
     let output = run(
         &runtime,
@@ -2657,12 +3021,131 @@ async fn paid_window_survives_login_and_revoke_clears_it() {
     .unwrap();
     assert_eq!(
         response_wire(output)["choices"][0]["message"]["content"],
-        "free after revoke"
+        "paid after revoke"
     );
-    assert_eq!(requested_models(&local).last().unwrap(), "hy3");
+    assert_eq!(requested_models(&local).last().unwrap(), "hy3-x");
     assert!(local.replies.lock().is_empty());
     println!(
-        "text resetAt: paid window coexists with pending login, survives login completion, and is removed by revoke"
+        "text resetAt: paid window coexists with pending login and survives login completion and revoke"
+    );
+}
+
+#[tokio::test]
+#[ignore = "build the release wasm32-wasip2 component first"]
+async fn paid_window_cas_conflict_preserves_competing_update() {
+    let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/wasm32-wasip2/release/stravia_vendor_workbuddy.wasm");
+    let runtime = VendorRuntime::new().unwrap();
+    let plugin = runtime
+        .load(&std::fs::read(artifact).unwrap())
+        .await
+        .unwrap();
+    let local = LocalUpstream::new(&["https://www.workbuddy.cn"], Some(&plugin));
+    let cell = local.cell(0, "workbuddy_paid_windows".into());
+    *cell.1.lock() = Some(
+        serde_json::to_vec(
+            &json!({"workbuddy_paid_windows":{"competing-account":4102444800000_i64}}),
+        )
+        .unwrap(),
+    );
+    let mut provider = paid_provider();
+    provider
+        .options
+        .insert("auto_paid_on_rate_limit".into(), json!(true));
+    local.reply(Reply::json(
+        json!({"code":6004,"resetAt":4102444800000_i64}),
+    ));
+    local.reply(Reply::stream(&completion_stream("hy3-x", "paid")));
+    let output = run(
+        &runtime,
+        &plugin,
+        "cn",
+        OperationInput::Infer {
+            provider,
+            request: request(),
+        },
+        local.scope(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        response_wire(output)["choices"][0]["message"]["content"],
+        "paid"
+    );
+    let stored = cell.0.lock();
+    assert_eq!(
+        stored.revision, 2,
+        "conflict must represent a real competing write followed by a retry"
+    );
+    let root: Value = serde_json::from_slice(stored.payload.as_deref().unwrap()).unwrap();
+    let windows = root["workbuddy_paid_windows"].as_object().unwrap();
+    assert_eq!(
+        windows.get("competing-account"),
+        Some(&json!(4102444800000_i64))
+    );
+    assert_eq!(
+        windows.len(),
+        2,
+        "retry must merge the new window with the competing one"
+    );
+}
+
+#[tokio::test]
+#[ignore = "build the release wasm32-wasip2 component first"]
+async fn legacy_paid_windows_are_not_imported() {
+    let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/wasm32-wasip2/release/stravia_vendor_workbuddy.wasm");
+    let runtime = VendorRuntime::new().unwrap();
+    let plugin = runtime
+        .load(&std::fs::read(artifact).unwrap())
+        .await
+        .unwrap();
+    let local = LocalUpstream::new(&["https://www.workbuddy.cn"], Some(&plugin));
+    let mut provider = paid_provider();
+    provider
+        .options
+        .insert("auto_paid_on_rate_limit".into(), json!(true));
+    let key = serde_json::to_string(&json!([
+        "workbuddy",
+        "cn",
+        "account-a",
+        null,
+        "hy3",
+        "hy3-x"
+    ]))
+    .unwrap();
+    let legacy =
+        serde_json::to_vec(&json!({"workbuddy_paid_windows":{(key):4102444800000_i64}})).unwrap();
+    *local.state.lock() = Some(legacy.clone());
+    local.reply(Reply::stream(&completion_stream(
+        "hy3",
+        "free after cutover",
+    )));
+    let output = run(
+        &runtime,
+        &plugin,
+        "cn",
+        OperationInput::Infer {
+            provider,
+            request: request(),
+        },
+        local.scope(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        response_wire(output)["choices"][0]["message"]["content"],
+        "free after cutover"
+    );
+    assert_eq!(requested_models(&local), ["hy3"]);
+    assert_eq!(local.state.lock().as_deref(), Some(legacy.as_slice()));
+    assert!(
+        local
+            .cell(0, "workbuddy_paid_windows".into())
+            .0
+            .lock()
+            .payload
+            .is_none()
     );
 }
 
@@ -2698,7 +3181,7 @@ async fn image_downloads_reject_unapproved_origins_and_never_forward_credentials
         ),
     ] {
         let origin = format!("https://{domain}");
-        let local = LocalUpstream::new(&[&origin, cdn]);
+        let local = LocalUpstream::new(&[&origin, cdn], Some(&plugin));
         let mut provider = snapshot(region, &origin);
         provider.model = Some("image-model".into());
         provider.credentials = BTreeMap::from([
@@ -2774,7 +3257,14 @@ async fn image_downloads_reject_unapproved_origins_and_never_forward_credentials
             let requests = local.requests.lock();
             let download = requests.last().unwrap();
             assert_eq!(download.method, "GET");
-            assert_eq!(download.headers, [("Accept".into(), "image/*".into())]);
+            assert!(
+                download.headers.iter().all(|field| {
+                    !["authorization", "x-user-id", "x-domain"]
+                        .iter()
+                        .any(|name| field.name.eq_ignore_ascii_case(name))
+                }),
+                "signed image downloads must not receive account credentials"
+            );
             assert!(download.body.is_empty());
         }
         provider.credentials.insert("region".into(), json!(other));

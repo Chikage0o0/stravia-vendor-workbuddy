@@ -17,7 +17,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-
       # rust-toolchain.toml 是工具链版本的唯一来源
       - name: Read rust-toolchain.toml
         id: toolchain
@@ -42,6 +41,11 @@ jobs:
 
       - name: Build wasm component
         run: cargo build --locked --release --lib --target wasm32-wasip2
+
+      - name: Verify unit and component contracts
+        run: |
+          cargo test --locked --lib
+          cargo test --locked --test component_contract -- --ignored --nocapture
 
       - name: Package dist
         run: |

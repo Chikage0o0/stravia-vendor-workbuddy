@@ -7,9 +7,8 @@ use serde_json::{Value, json};
 use stravia_runtime_contract::protocol::ir::Usage;
 use stravia_vendor_common::common;
 use stravia_vendor_sdk::{
-    AiErrorKind, ErrorKind, GuestHost, HttpRequest, MediaArtifact, MediaImageAspectRatio,
-    MediaImageRequest, MediaImageResolution, MediaImageResponse, PluginError, ProviderSnapshot,
-    read_http_body,
+    AiErrorKind, ErrorKind, GuestHost, MediaArtifact, MediaImageAspectRatio, MediaImageRequest,
+    MediaImageResolution, MediaImageResponse, PluginError, ProviderSnapshot, read_http_body,
 };
 
 use crate::{Region, auth, request_context::RequestContext};
@@ -44,16 +43,19 @@ pub(crate) fn generate(
     let body = serde_json::to_vec(&body)
         .map_err(|_| invalid("WorkBuddy image request could not be encoded"))?;
     host.emit_started()?;
-    let response = host.http_start(HttpRequest {
-        method: "POST".into(),
-        url: format!(
-            "{}/v2/images/{}",
-            region.origin(),
-            if edit { "edits" } else { "generations" }
+    let response = host.http_start(
+        auth::net_request(
+            "POST",
+            format!(
+                "{}/v2/images/{}",
+                region.origin(),
+                if edit { "edits" } else { "generations" }
+            ),
+            headers,
+            body,
         ),
-        headers,
-        body,
-    })?;
+        &auth::net_options(),
+    )?;
     let status = response.status()?;
     let headers = response.headers()?;
     let body = read_http_body(
@@ -77,12 +79,15 @@ pub(crate) fn generate(
     if let Some(url) = artifact.upstream_ref.take() {
         let url = download_url(&url)?;
         // COS 签名 URL 不属于账号 API；绝不复用 Authorization、账号或会话标头。
-        let response = host.http_start(HttpRequest {
-            method: "GET".into(),
-            url: url.into(),
-            headers: vec![("Accept".into(), "image/*".into())],
-            body: Vec::new(),
-        })?;
+        let response = host.http_start(
+            auth::net_request(
+                "GET",
+                url,
+                vec![("Accept".into(), "image/*".into())],
+                Vec::new(),
+            ),
+            &auth::net_options(),
+        )?;
         let status = response.status()?;
         if !(200..300).contains(&status) {
             return Err(upstream(&format!("WorkBuddy image download HTTP {status}")));
@@ -90,8 +95,9 @@ pub(crate) fn generate(
         let headers = response.headers()?;
         let mime = headers
             .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-            .map(|(_, value)| value.split(';').next().unwrap_or_default().trim())
+            .find(|field| field.name.eq_ignore_ascii_case("content-type"))
+            .and_then(|field| std::str::from_utf8(&field.bytes).ok())
+            .map(|value| value.split(';').next().unwrap_or_default().trim())
             .filter(|mime| image_mime(mime))
             .ok_or_else(|| upstream("WorkBuddy image download has invalid MIME"))?;
         artifact.media_type = mime.to_owned();

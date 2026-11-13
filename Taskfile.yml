@@ -20,9 +20,19 @@ tasks:
       - cargo test --locked --lib --target-dir target
       - cargo test --locked --test component_contract --target-dir target -- --ignored --nocapture
 
+  verify-shape:
+    desc: 使用匹配的宿主工具离线验证组件与冷连接 fixture
+    deps: [build]
+    requires:
+      vars: [STRAVIA_TOOLS]
+    cmds:
+      - '"{{.STRAVIA_TOOLS}}" verify-egress-shape --component "{{.WASM}}" --shape plugin:workbuddy --fixture tests/fixtures/workbuddy-windows-main.json --server-name www.workbuddy.cn'
+
   verify:
     desc: 构建并执行全部验证
     deps: [test]
+    cmds:
+      - task: verify-shape
 
   dist:
     desc: 构建并打包 dist/（组件、许可证与 SHA256SUMS）

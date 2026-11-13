@@ -1,4 +1,39 @@
+# 构建产物与任务缓存
 /target/
 /dist/
+/.task/
+**/*.rs.bk
 *.info
+
+# devenv / direnv（共享配置和锁文件需要提交）
+/.devenv/
+/.devenv.flake.nix
+/devenv.local.nix
+/devenv.local.yaml
+/.direnv/
+
+# Python 缓存与虚拟环境
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# 本地凭据与日志；保留可提交的配置示例
 .env
+.env.*
+!.env.example
+!.env.*.example
+*.log
+/logs/
+
+# 编辑器、临时资料与操作系统文件
+.idea/
+.vscode/
+*.sw?
+/.scratch/
+.DS_Store
+Thumbs.db
+Desktop.ini

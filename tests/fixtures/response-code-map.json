@@ -1,0 +1,6 @@
+{
+  "fields": ["code"],
+  "codes": {
+    "6004": "rate_limit"
+  }
+}

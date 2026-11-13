@@ -16,12 +16,39 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use stravia_vendor_common::common;
+use stravia_vendor_sdk::net::{Fields, Options, Request};
 use stravia_vendor_sdk::{
-    AuthRequest, AuthResponse, AuthStep, ErrorKind, GuestHost, HttpRequest, PluginError,
-    ProviderSnapshot, read_http_body,
+    AuthRequest, AuthResponse, AuthStep, ErrorKind, GuestHost, PluginError, ProviderSnapshot,
+    read_http_body,
 };
 
 use crate::{Region, VENDOR_ID};
+
+pub(crate) fn net_request(
+    method: &str,
+    url: impl Into<String>,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+) -> Request {
+    let mut fields = Fields::new();
+    for (name, value) in headers {
+        fields.append(name, value.into_bytes());
+    }
+    if !body.is_empty() && fields.get("Content-Length").is_none() {
+        fields.slot("Content-Length");
+    }
+    fields.slot("Host");
+    fields.append("Connection", b"keep-alive".to_vec());
+    Request::new(method, url).fields(fields).body(body)
+}
+
+pub(crate) fn net_options() -> Options {
+    let mut options = Options::new();
+    options
+        .shape("plugin:workbuddy")
+        .expect("workbuddy shape is valid");
+    options
+}
 
 /// 发起浏览器登录，返回 `{state, authUrl}`。
 const AUTH_STATE_PATH: &str = "/v2/plugin/auth/state";
@@ -41,7 +68,7 @@ const MAX_AUTH_BODY: usize = 256 * 1024;
 const STATE_VERSION: u32 = 1;
 
 // 固定 Windows/x64 兼容 profile，不检测 Wasm 宿主；SDK 6.25.0、Electron 37.10.3 的 Node 22.21.1。
-const INFERENCE_SDK_HEADERS: [(&str, &str); 8] = [
+const INFERENCE_SDK_HEADERS: [(&str, &str); 7] = [
     ("X-Stainless-Lang", "js"),
     ("X-Stainless-Package-Version", "6.25.0"),
     ("X-Stainless-OS", "Windows"),
@@ -50,7 +77,6 @@ const INFERENCE_SDK_HEADERS: [(&str, &str); 8] = [
     ("X-Stainless-Runtime-Version", "v22.21.1"),
     // 免费→付费是新的模型请求，不是 SDK 网络重试。
     ("X-Stainless-Retry-Count", "0"),
-    ("X-Stainless-Timeout", "600"),
 ];
 
 /// 写入宿主私有状态的待登录会话。
@@ -271,9 +297,9 @@ fn refresh(
     })
 }
 
-/// 吊销：无已知的上游吊销端点，清除本地待登录状态与付费窗口并报告 Revoked。
+/// 吊销：清除本地待登录状态，付费窗口存于独立的 provider 状态。
 fn revoke(host: &GuestHost) -> Result<AuthResponse, PluginError> {
-    host.write_private_state(b"")?;
+    clear_pending(host)?;
     Ok(AuthResponse::Revoked)
 }
 
@@ -674,12 +700,7 @@ fn json_request(
     headers: Vec<(String, String)>,
     body: Vec<u8>,
 ) -> Result<Value, PluginError> {
-    let response = host.http_start(HttpRequest {
-        method: method.to_owned(),
-        url: url.to_owned(),
-        headers,
-        body,
-    })?;
+    let response = host.http_start(net_request(method, url, headers, body), &net_options())?;
     let status = response.status()?;
     let response_headers = response.headers()?;
     let bytes = read_http_body(&response, MAX_AUTH_BODY)?;

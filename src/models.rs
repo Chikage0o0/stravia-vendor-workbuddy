@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use stravia_vendor_common::common;
 use stravia_vendor_sdk::{
     ConfigValidationResponse, DiscoverRequest, DiscoverResponse, DiscoveredModel, ErrorKind,
-    GuestHost, HttpRequest, PluginError, ProviderSnapshot, ValidationIssue, read_http_body,
+    GuestHost, PluginError, ProviderSnapshot, ValidationIssue, read_http_body,
 };
 
 use crate::{Region, auth, messages};
@@ -121,13 +121,16 @@ fn load_config(
     region: Region,
     headers: Vec<(String, String)>,
 ) -> Result<Value, PluginError> {
-    // 桌面入口由区域配置固定；响应里的 endpoint 不得重写后续请求或扩大网络权限。
-    let response = host.http_start(HttpRequest {
-        method: "GET".into(),
-        url: format!("{}/v3/config", region.origin()),
-        headers,
-        body: Vec::new(),
-    })?;
+    // 区域入口固定；响应里的 endpoint 不得重写后续请求或扩大网络权限。
+    let response = host.http_start(
+        auth::net_request(
+            "GET",
+            format!("{}/v3/config", region.origin()),
+            headers,
+            Vec::new(),
+        ),
+        &auth::net_options(),
+    )?;
     let status = response.status()?;
     let response_headers = response.headers()?;
     let body = read_http_body(&response, MAX_CONFIG_BODY)?;

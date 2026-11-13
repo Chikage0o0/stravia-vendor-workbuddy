@@ -53,6 +53,8 @@ pub(crate) fn descriptor() -> VendorDescriptor {
         authors: vec!["Chikage0o0 <chikage@939.me>".into()],
         canonical_format_version: CANONICAL_FORMAT_VERSION,
         kind: VendorKind::Dedicated,
+        egress_shapes: vec![serde_json::from_str(include_str!("../assets/workbuddy.json"))
+            .expect("valid embedded WorkBuddy egress shape")],
         providers: vec![ProviderDescriptor {
             provider_id: VENDOR_ID.into(),
             catalog_id: None,

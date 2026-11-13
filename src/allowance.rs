@@ -3,8 +3,8 @@ use serde_json::Value;
 use stravia_vendor_common::{account::first_account_label, common, connection_check};
 use stravia_vendor_sdk::{
     AllowanceAmount, AllowanceItem, AllowanceResponse, ConnectionCheckResponse,
-    ConnectionCheckVerification, ErrorKind, GuestHost, HttpRequest, LogLevel, PluginError,
-    ProviderSnapshot, read_http_body,
+    ConnectionCheckVerification, ErrorKind, GuestHost, LogLevel, PluginError, ProviderSnapshot,
+    read_http_body,
 };
 
 use crate::{Region, auth};
@@ -17,12 +17,15 @@ pub(crate) fn execute(
     provider: &ProviderSnapshot,
     region: Region,
 ) -> Result<AllowanceResponse, PluginError> {
-    let response = host.http_start(HttpRequest {
-        method: "POST".into(),
-        url: format!("{}{SUMMARY_PATH}", region.origin()),
-        headers: auth::billing_headers(provider, region)?,
-        body: b"{}".to_vec(),
-    })?;
+    let response = host.http_start(
+        auth::net_request(
+            "POST",
+            format!("{}{SUMMARY_PATH}", region.origin()),
+            auth::billing_headers(provider, region)?,
+            b"{}".to_vec(),
+        ),
+        &auth::net_options(),
+    )?;
     let status = response.status()?;
     let headers = response.headers()?;
     let bytes = read_http_body(&response, MAX_BODY_BYTES)?;
@@ -33,10 +36,7 @@ pub(crate) fn execute(
     }
     let value: Value =
         serde_json::from_slice(&bytes).map_err(|_| malformed("invalid allowance JSON"))?;
-    let mut totals = Credits::default();
-    for row in packages(&value)? {
-        totals.include(package(row)?)?;
-    }
+    let totals = summary(&value)?;
     // 资料只是附加展示；读取失败不能抹掉已经成功取得的积分。
     let account_label = load_account_profile(host, provider, region)
         .map(|value| account_label(&value, provider, region))
@@ -80,12 +80,15 @@ fn load_account_profile(
         Region::Cn => "/v2/plugin/account",
         Region::Intl => "/v2/plugin/accounts",
     };
-    let response = host.http_start(HttpRequest {
-        method: "GET".into(),
-        url: format!("{}{path}", region.origin()),
-        headers: auth::headers(provider, region)?,
-        body: Vec::new(),
-    })?;
+    let response = host.http_start(
+        auth::net_request(
+            "GET",
+            format!("{}{path}", region.origin()),
+            auth::headers(provider, region)?,
+            Vec::new(),
+        ),
+        &auth::net_options(),
+    )?;
     let status = response.status()?;
     let headers = response.headers()?;
     let bytes = read_http_body(&response, MAX_BODY_BYTES)?;
@@ -148,6 +151,53 @@ fn matching_account<'a>(
     Some(account)
 }
 
+fn summary(value: &Value) -> Result<Summary, PluginError> {
+    let code = value
+        .get("code")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| malformed("invalid WorkBuddy allowance summary status"))?;
+    if code != 0 {
+        return Err(common::plugin_error(
+            ErrorKind::upstream_unknown(),
+            "WorkBuddy billing service rejected the allowance query",
+        ));
+    }
+    let data = value
+        .get("data")
+        .filter(|data| data.is_object())
+        .ok_or_else(|| malformed("invalid WorkBuddy allowance summary data"))?;
+    let reported = match data.get("TotalCredits") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(amount(data, "TotalCredits")?),
+    };
+    let details = (|| {
+        let mut totals = Credits::default();
+        for row in packages(value)? {
+            totals.include(package(row)?)?;
+        }
+        Ok::<_, PluginError>(totals)
+    })();
+    match reported {
+        Some(remaining) => Ok(Summary {
+            remaining,
+            // Package totals describe the same balance only when their remaining sum agrees.
+            details: details.ok().filter(|totals| totals.remaining == remaining),
+        }),
+        None => {
+            let totals = details?;
+            Ok(Summary {
+                remaining: totals.remaining,
+                details: Some(totals),
+            })
+        }
+    }
+}
+
+struct Summary {
+    remaining: Decimal,
+    details: Option<Credits>,
+}
+
 fn packages(value: &Value) -> Result<&[Value], PluginError> {
     let code = value
         .get("code")
@@ -181,25 +231,40 @@ impl Credits {
         Ok(())
     }
 
+    #[cfg(test)]
     fn into_allowance(self, region: Region) -> AllowanceItem {
-        let total = self.total.normalize().to_string();
-        // 汇总接口直接给出本周期的精确计数，不再从资源包余额反推或跨周期相加。
-        let used_percent = (self.total > Decimal::ZERO).then(|| {
-            (self.used.clamp(Decimal::ZERO, self.total) / self.total * Decimal::ONE_HUNDRED)
-                .round_dp(2)
-                .normalize()
-                .to_string()
+        Summary {
+            remaining: self.remaining,
+            details: Some(self),
+        }
+        .into_allowance(region)
+    }
+}
+
+impl Summary {
+    fn into_allowance(self, region: Region) -> AllowanceItem {
+        let used_percent = self.details.as_ref().and_then(|details| {
+            (details.total > Decimal::ZERO).then(|| {
+                (details.used.clamp(Decimal::ZERO, details.total) / details.total
+                    * Decimal::ONE_HUNDRED)
+                    .round_dp(2)
+                    .normalize()
+                    .to_string()
+            })
         });
+        let label = match (&self.details, region) {
+            (Some(details), Region::Cn) => format!("总积分 {}", details.total.normalize()),
+            (Some(details), Region::Intl) => format!("Total credits {}", details.total.normalize()),
+            (None, Region::Cn) => "积分余额".into(),
+            (None, Region::Intl) => "Credit balance".into(),
+        };
         AllowanceItem {
             key: "workbuddy_credits_total".into(),
-            label: match region {
-                Region::Cn => format!("总积分 {total}"),
-                Region::Intl => format!("Total credits {total}"),
-            },
+            label,
             kind: "balance".into(),
-            used: Some(credit(self.used)),
+            used: self.details.as_ref().map(|details| credit(details.used)),
             remaining: Some(credit(self.remaining)),
-            limit: Some(credit(self.total)),
+            limit: self.details.as_ref().map(|details| credit(details.total)),
             used_percent,
             window_seconds: None,
             resets_at_unix_ms: None,
@@ -256,6 +321,65 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn summary_prefers_reported_balance_without_double_counting_or_inventing_usage() {
+        let payload = json!({"code":0,"data":{"TotalCredits":"25.5","Packages":[
+            {"CycleTotalCapacity":100,"CycleRemainCapacity":20,"CycleUsedCapacity":80}
+        ]}});
+        let result = summary(&payload).unwrap().into_allowance(Region::Cn);
+        assert_eq!(result.remaining.unwrap().value, "25.5");
+        assert!(result.used.is_none());
+        assert!(result.limit.is_none());
+        assert!(result.used_percent.is_none());
+
+        let zero = json!({"code":0,"data":{"TotalCredits":0,"Packages":[
+            {"CycleTotalCapacity":100,"CycleRemainCapacity":20,"CycleUsedCapacity":80}
+        ]}});
+        assert_eq!(
+            summary(&zero)
+                .unwrap()
+                .into_allowance(Region::Cn)
+                .remaining
+                .unwrap()
+                .value,
+            "0"
+        );
+        assert!(
+            summary(&json!({"code":0,"data":{"TotalCredits":"invalid","Packages":[]}})).is_err()
+        );
+    }
+
+    #[test]
+    fn summary_handles_matching_missing_and_incomplete_packages() {
+        let row = json!({"CycleTotalCapacity":10,"CycleRemainCapacity":7,"CycleUsedCapacity":3});
+        let matching =
+            summary(&json!({"code":0,"data":{"TotalCredits":7,"Packages":[row.clone()]}}))
+                .unwrap()
+                .into_allowance(Region::Intl);
+        assert_eq!(matching.remaining.unwrap().value, "7");
+        assert_eq!(matching.used.unwrap().value, "3");
+        assert_eq!(matching.limit.unwrap().value, "10");
+        let aggregate_only = summary(&json!({"code":0,"data":{"TotalCredits":"7.25"}}))
+            .unwrap()
+            .into_allowance(Region::Intl);
+        assert_eq!(aggregate_only.remaining.unwrap().value, "7.25");
+        assert!(aggregate_only.used.is_none());
+        let incomplete = summary(
+            &json!({"code":0,"data":{"TotalCredits":7,"Packages":[{"CycleRemainCapacity":7}]}}),
+        )
+        .unwrap()
+        .into_allowance(Region::Intl);
+        assert_eq!(incomplete.remaining.unwrap().value, "7");
+        assert!(incomplete.limit.is_none());
+        let legacy = summary(&json!({"code":0,"data":{"Packages":[row]}}))
+            .unwrap()
+            .into_allowance(Region::Intl);
+        assert_eq!(legacy.remaining.unwrap().value, "7");
+        assert!(
+            summary(&json!({"code":0,"data":{"Packages":[{"CycleRemainCapacity":7}]}})).is_err()
+        );
+    }
 
     #[test]
     fn summary_packages_preserve_fractional_account_usage() {
